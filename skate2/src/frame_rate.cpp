@@ -1,5 +1,6 @@
 #include "frame_rate.h"
 
+#include "draw_probe.h"
 #include "frame_pacing.h"
 
 #include <rex/cvar.h>
@@ -155,6 +156,7 @@ bool ValidateSkate2FrameRate() {
 void Skate2PresentationInterval(PPCRegister& r11) {
   // This hook runs once per guest swap on the guest render thread, before the
   // swap is handed to the GPU: the frame limiter paces here.
+  NoteSkate2DrawProbeFrame();
   PaceSkate2Frame();
   if (configured_settings && configured_settings->interval_override != 0) {
     r11.u64 = configured_settings->interval_override;

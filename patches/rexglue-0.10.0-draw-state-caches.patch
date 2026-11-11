@@ -1,0 +1,1178 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index baaf1a0..165ad71 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -60,7 +60,12 @@ class D3D12CommandProcessor : public CommandProcessor {
+                                bool blocking) override;
+ 
+   ui::d3d12::D3D12Provider& GetD3D12Provider() const {
+-    return *static_cast<ui::d3d12::D3D12Provider*>(graphics_system_->provider());
++    // Called several times per draw. The provider outlives the command
++    // processor, so remember it instead of a virtual call each time.
++    if (!d3d12_provider_) [[unlikely]] {
++      d3d12_provider_ = static_cast<ui::d3d12::D3D12Provider*>(graphics_system_->provider());
++    }
++    return *d3d12_provider_;
+   }
+ 
+   // Returns the deferred drawing command list for the currently open
+@@ -374,6 +379,13 @@ class D3D12CommandProcessor : public CommandProcessor {
+                                   uint32_t used_texture_mask,
+                                   reg::RB_DEPTHCONTROL normalized_depth_control,
+                                   uint32_t normalized_color_mask);
++  // Returns whether any system constant has changed.
++  bool UpdateSystemConstantValuesImpl(bool shared_memory_is_uav, bool primitive_polygonal,
++                                      uint32_t line_loop_closing_index, xenos::Endian index_endian,
++                                      const draw_util::ViewportInfo& viewport_info,
++                                      uint32_t used_texture_mask,
++                                      reg::RB_DEPTHCONTROL normalized_depth_control,
++                                      uint32_t normalized_color_mask);
+   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
+                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
+   bool IssueCopy_ReadbackResolvePath();
+@@ -862,6 +874,57 @@ class D3D12CommandProcessor : public CommandProcessor {
+   // the fake result as well, even if the probe was switched off in between.
+   bool debug_drop_query_open_ = false;
+   std::unique_ptr<DebugDropDrawsStats> debug_drop_draws_stats_;
++
++  // See GetD3D12Provider.
++  mutable ui::d3d12::D3D12Provider* d3d12_provider_ = nullptr;
++
++  // d3d12_draw_state_cache in UpdateBindings. Sampler parameters are a function
++  // of the texture fetch constant, the shader's sampler binding and
++  // anisotropic_override, so they're recomputed only when one of those differs
++  // from what current_samplers_#_[i] was computed from. Games mostly change
++  // only the textures of a few draws out of many.
++  struct SamplerParametersInputs {
++    uint32_t fetch[6];
++    // Packed shader sampler binding fields, UINT32_MAX if not known.
++    uint32_t binding;
++    int32_t anisotropic_override;
++  };
++  std::vector<SamplerParametersInputs> current_sampler_inputs_vertex_;
++  std::vector<SamplerParametersInputs> current_sampler_inputs_pixel_;
++  bool UpdateSamplerParameters(const std::vector<D3D12Shader::SamplerBinding>& samplers,
++                               std::vector<D3D12TextureCache::SamplerParameters>& current_samplers,
++                               std::vector<SamplerParametersInputs>& current_inputs,
++                               bool use_cache, bool validate, int32_t anisotropic_override);
++  // Texture cache bindings version with which current_texture_srv_keys_#_ were
++  // last written or found up to date: while it's the same, they still are.
++  uint64_t texture_srv_keys_bindings_version_vertex_ = UINT64_MAX;
++  uint64_t texture_srv_keys_bindings_version_pixel_ = UINT64_MAX;
++  uint64_t draw_state_cache_mismatches_ = 0;
++
++  // d3d12_draw_state_cache in UpdateSystemConstantValues: everything the
++  // system constants are computed from. If it's the same as for the previous
++  // draw, the constants are the same too, and computing them is skipped. Most
++  // draws only change the shader constants, textures and vertex data.
++  // Compared with memcmp, so it must have no padding.
++  struct SystemConstantsInputs {
++    uint32_t registers[35];
++    uint32_t user_clip_planes[6 * 4];
++    uint32_t flags;
++    uint32_t line_loop_closing_index;
++    uint32_t index_endian;
++    uint32_t used_texture_mask;
++    uint32_t normalized_depth_control;
++    uint32_t normalized_color_mask;
++    float ndc_scale[3];
++    float ndc_offset[3];
++    uint32_t xy_extent[2];
++    // Of the used textures only.
++    uint32_t texture_swizzled_signs[8];
++    uint32_t textures_resolution_scaled;
++  };
++  static_assert(sizeof(SystemConstantsInputs) == sizeof(uint32_t) * 82);
++  SystemConstantsInputs system_constants_inputs_;
++  bool system_constants_inputs_valid_ = false;
+ };
+ 
+ }  // namespace rex::graphics::d3d12
+diff --git a/include/rex/graphics/d3d12/render_target_cache.h b/include/rex/graphics/d3d12/render_target_cache.h
+index 9e8b3dd..adba2b8 100644
+--- a/include/rex/graphics/d3d12/render_target_cache.h
++++ b/include/rex/graphics/d3d12/render_target_cache.h
+@@ -54,7 +54,9 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+   void CompletedSubmissionUpdated();
+   void BeginSubmission();
+ 
+-  Path GetPath() const override { return path_; }
++  // final: called several times per draw by the command processor, which can
++  // then read path_ directly instead of making a virtual call.
++  Path GetPath() const final { return path_; }
+ 
+   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
+diff --git a/include/rex/graphics/d3d12/texture_cache.h b/include/rex/graphics/d3d12/texture_cache.h
+index 0c899a4..43136aa 100644
+--- a/include/rex/graphics/d3d12/texture_cache.h
++++ b/include/rex/graphics/d3d12/texture_cache.h
+@@ -262,19 +262,37 @@ class D3D12TextureCache final : public TextureCache {
+ 
+     ID3D12Resource* resource() const { return resource_.Get(); }
+ 
++    D3D12_RESOURCE_STATES GetResourceState() const { return resource_state_; }
+     D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
+       D3D12_RESOURCE_STATES old_state = resource_state_;
++      if (old_state != new_state) {
++        // Lets the per-draw texture transition loop be skipped while no texture
++        // has changed its state (see RequestTextures).
++        ++static_cast<D3D12TextureCache&>(texture_cache()).texture_state_changes_;
++      }
+       resource_state_ = new_state;
+       return old_state;
+     }
+ 
+     uint32_t GetSRVDescriptorIndex(SRVDescriptorKey descriptor_key) const {
++      // Textures are mostly bound with the same view, remember the last one.
++      // Descriptors are only destroyed together with the texture.
++      if (last_srv_descriptor_index_ != UINT32_MAX && descriptor_key == last_srv_descriptor_key_) {
++        return last_srv_descriptor_index_;
++      }
+       auto it = srv_descriptors_.find(descriptor_key);
+-      return it != srv_descriptors_.cend() ? it->second : UINT32_MAX;
++      if (it == srv_descriptors_.cend()) {
++        return UINT32_MAX;
++      }
++      last_srv_descriptor_key_ = descriptor_key;
++      last_srv_descriptor_index_ = it->second;
++      return it->second;
+     }
+ 
+     void AddSRVDescriptorIndex(SRVDescriptorKey descriptor_key, uint32_t descriptor_index) {
+       srv_descriptors_.emplace(descriptor_key, descriptor_index);
++      last_srv_descriptor_key_ = descriptor_key;
++      last_srv_descriptor_index_ = descriptor_index;
+     }
+ 
+     void SetHeapBlock(const TextureHeapBlock& heap_block) { heap_block_ = heap_block; }
+@@ -291,6 +309,8 @@ class D3D12TextureCache final : public TextureCache {
+     // according to profiling, was often a bottleneck in many games).
+     // For bindless - indices in the global shader-visible descriptor heap.
+     std::unordered_map<SRVDescriptorKey, uint32_t, SRVDescriptorKey::Hasher> srv_descriptors_;
++    mutable SRVDescriptorKey last_srv_descriptor_key_;
++    mutable uint32_t last_srv_descriptor_index_ = UINT32_MAX;
+   };
+ 
+   static constexpr uint32_t kSRVDescriptorCachePageSize = 65536;
+@@ -494,6 +514,18 @@ class D3D12TextureCache final : public TextureCache {
+ 
+   std::array<D3D12TextureBinding, xenos::kTextureFetchConstantCount> d3d12_texture_bindings_;
+ 
++  // d3d12_draw_state_cache: RequestTextures marks every used texture as used
++  // in the submission and transitions it to the shader resource state in every
++  // draw. That is skipped while the bindings, the submission and the states of
++  // all textures are the same as after the last time it was done.
++  uint64_t texture_state_changes_ = 0;
++  bool textures_transitioned_valid_ = false;
++  uint32_t textures_transitioned_mask_ = 0;
++  uint64_t textures_transitioned_bindings_version_ = 0;
++  uint64_t textures_transitioned_submission_ = 0;
++  uint64_t textures_transitioned_state_changes_ = 0;
++  uint64_t draw_state_cache_mismatches_ = 0;
++
+   // Unsupported texture formats used during this frame (for research and
+   // testing).
+   enum : uint8_t {
+diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
+index 2cf24c4..247f334 100644
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -48,6 +48,8 @@ REXCVAR_DECLARE(bool, direct_host_resolve);
+ REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
+ REXCVAR_DECLARE(bool, gpu_3d_to_2d_texture);
+ REXCVAR_DECLARE(int32_t, anisotropic_override);
++REXCVAR_DECLARE(bool, gpu_texture_binding_cache);
++REXCVAR_DECLARE(bool, gpu_draw_state_cache_validate);
+ REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_render_to_texture);
+ REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_soft);
+ REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_hard);
+@@ -94,6 +96,7 @@ REXCVAR_DECLARE(bool, vulkan_readback_memexport);
+ REXCVAR_DECLARE(bool, dxbc_switch);
+ REXCVAR_DECLARE(bool, dxbc_source_map);
+ REXCVAR_DECLARE(bool, d3d12_bindless);
++REXCVAR_DECLARE(bool, d3d12_draw_state_cache);
+ REXCVAR_DECLARE(bool, d3d12_submit_on_primary_buffer_end);
+ REXCVAR_DECLARE(bool, d3d12_dxbc_disasm);
+ REXCVAR_DECLARE(bool, d3d12_dxbc_disasm_dxilconv);
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index bd759e9..d69b785 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -111,6 +111,11 @@ class TextureCache {
+ 
+   virtual void RequestTextures(uint32_t used_texture_mask);
+ 
++  // Changes whenever any texture binding (key, swizzle, signedness or texture
++  // objects) may have changed, so per-draw work that only depends on the
++  // bindings can be skipped while it's the same as in an earlier draw.
++  uint64_t texture_bindings_version() const { return texture_bindings_version_; }
++
+   // "ActiveTexture" means as of the latest RequestTextures call.
+ 
+   uint32_t GetActiveTextureHostSwizzle(uint32_t fetch_constant_index) const {
+@@ -543,6 +548,7 @@ class TextureCache {
+     const TextureBinding& binding = texture_bindings_[fetch_constant_index];
+     return binding.key.is_valid ? &binding : nullptr;
+   }
++  uint64_t current_submission_index() const { return current_submission_index_; }
+   // Called when something in a texture binding is changed for the
+   // implementation to update the internal dependencies of the binding.
+   virtual void UpdateTextureBindingsImpl(uint32_t /*fetch_constant_mask*/) {}
+@@ -623,6 +629,41 @@ class TextureCache {
+   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
+   // constants again and again.
+   uint32_t texture_bindings_in_sync_ = 0;
++  uint64_t texture_bindings_version_ = 0;
++
++  // gpu_texture_binding_cache: games rebind the same few hundred textures many
++  // times per frame, and each rebinding decoded the fetch constant and looked
++  // the texture up by its key. This direct-mapped table remembers the result by
++  // the raw fetch constant words. Entries are valid only for the epoch they
++  // were filled in, which changes when any texture is destroyed and when the
++  // scaled resolve state of any memory page changes (that decides whether the
++  // scaled or the unscaled texture is used). Loading of outdated texture data
++  // is still checked on every rebinding, as before.
++  struct TextureBindingMemoEntry {
++    uint32_t fetch[6];
++    uint32_t epoch;  // 0 - empty.
++    uint32_t host_swizzle;
++    TextureKey key;
++    // FindOrCreateTexture results for key and for key with signed_separate,
++    // valid if the respective looked_up bit is set. Failures aren't stored, so
++    // creation is retried like without the table.
++    Texture* texture;
++    Texture* texture_signed;
++    uint8_t swizzled_signs;
++    uint8_t looked_up;
++  };
++  static constexpr uint32_t kTextureBindingMemoSizeLog2 = 11;
++  std::unique_ptr<TextureBindingMemoEntry[]> texture_binding_memo_;
++  std::atomic<uint32_t> texture_binding_memo_epoch_{1};
++  bool texture_binding_memo_disabled_since_use_ = false;
++  void InvalidateTextureBindingMemo() {
++    texture_binding_memo_epoch_.fetch_add(1, std::memory_order_acq_rel);
++  }
++  Texture* FindOrCreateTextureMemo(TextureBindingMemoEntry* memo, const TextureKey& key,
++                                   bool signed_version);
++  void ValidateTextureBindingMemo(const TextureBindingMemoEntry& memo,
++                                  const xenos::xe_gpu_texture_fetch_t& fetch);
++  uint64_t texture_binding_memo_mismatches_ = 0;
+ };
+ 
+ }  // namespace rex::graphics
+diff --git a/include/rex/math.h b/include/rex/math.h
+index ab7960f..4e4f22d 100644
+--- a/include/rex/math.h
++++ b/include/rex/math.h
+@@ -126,18 +126,38 @@ constexpr uint32_t bit_count(T v) {
+   return static_cast<uint32_t>(std::popcount(v));
+ }
+ 
++// The bit counting and scanning helpers are defined inline: they are used in
++// per-draw loops of the GPU emulation, and as out-of-line functions exported
++// from the runtime every call went through a DLL import.
++
+ // lzcnt - count leading zeros.
+ // Returns the size of the input operand if value is zero.
+-uint8_t lzcnt(uint8_t v);
+-uint8_t lzcnt(uint16_t v);
+-uint8_t lzcnt(uint32_t v);
+-uint8_t lzcnt(uint64_t v);
++inline uint8_t lzcnt(uint8_t v) {
++  return v == 0 ? 8 : static_cast<uint8_t>(std::countl_zero(v));
++}
++inline uint8_t lzcnt(uint16_t v) {
++  return v == 0 ? 16 : static_cast<uint8_t>(std::countl_zero(v));
++}
++inline uint8_t lzcnt(uint32_t v) {
++  return v == 0 ? 32 : static_cast<uint8_t>(std::countl_zero(v));
++}
++inline uint8_t lzcnt(uint64_t v) {
++  return v == 0 ? 64 : static_cast<uint8_t>(std::countl_zero(v));
++}
+ 
+ // tzcnt - count trailing zeros.
+-uint8_t tzcnt(uint8_t v);
+-uint8_t tzcnt(uint16_t v);
+-uint8_t tzcnt(uint32_t v);
+-uint8_t tzcnt(uint64_t v);
++inline uint8_t tzcnt(uint8_t v) {
++  return v == 0 ? 8 : static_cast<uint8_t>(std::countr_zero(v));
++}
++inline uint8_t tzcnt(uint16_t v) {
++  return v == 0 ? 16 : static_cast<uint8_t>(std::countr_zero(v));
++}
++inline uint8_t tzcnt(uint32_t v) {
++  return v == 0 ? 32 : static_cast<uint8_t>(std::countr_zero(v));
++}
++inline uint8_t tzcnt(uint64_t v) {
++  return v == 0 ? 64 : static_cast<uint8_t>(std::countr_zero(v));
++}
+ inline uint8_t lzcnt(int8_t v) {
+   return lzcnt(static_cast<uint8_t>(v));
+ }
+@@ -167,8 +187,20 @@ inline uint8_t tzcnt(int64_t v) {
+ // Search the value from least significant bit (LSB) to the most significant bit
+ // (MSB) for a set bit (1).
+ // Returns false if no bits are set and the output index is invalid.
+-bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index);
+-bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index);
++inline bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index) {
++  if (v == 0) {
++    return false;
++  }
++  *out_first_set_index = static_cast<uint32_t>(std::countr_zero(v));
++  return true;
++}
++inline bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index) {
++  if (v == 0) {
++    return false;
++  }
++  *out_first_set_index = static_cast<uint32_t>(std::countr_zero(v));
++  return true;
++}
+ inline bool bit_scan_forward(int32_t v, uint32_t* out_first_set_index) {
+   return bit_scan_forward(static_cast<uint32_t>(v), out_first_set_index);
+ }
+diff --git a/src/core/math_gcc.cpp b/src/core/math_gcc.cpp
+index 1ec7192..a7c890d 100644
+--- a/src/core/math_gcc.cpp
++++ b/src/core/math_gcc.cpp
+@@ -5,43 +5,4 @@
+ static_assert(false, "This file is non-MSVC only");
+ #endif
+ 
+-namespace rex {
+-
+-uint8_t lzcnt(uint8_t v) {
+-  return v == 0 ? 8 : static_cast<uint8_t>(__builtin_clz(v) - 24);
+-}
+-uint8_t lzcnt(uint16_t v) {
+-  return v == 0 ? 16 : static_cast<uint8_t>(__builtin_clz(v) - 16);
+-}
+-uint8_t lzcnt(uint32_t v) {
+-  return v == 0 ? 32 : static_cast<uint8_t>(__builtin_clz(v));
+-}
+-uint8_t lzcnt(uint64_t v) {
+-  return v == 0 ? 64 : static_cast<uint8_t>(__builtin_clzll(v));
+-}
+-
+-uint8_t tzcnt(uint8_t v) {
+-  return v == 0 ? 8 : static_cast<uint8_t>(__builtin_ctz(v));
+-}
+-uint8_t tzcnt(uint16_t v) {
+-  return v == 0 ? 16 : static_cast<uint8_t>(__builtin_ctz(v));
+-}
+-uint8_t tzcnt(uint32_t v) {
+-  return v == 0 ? 32 : static_cast<uint8_t>(__builtin_ctz(v));
+-}
+-uint8_t tzcnt(uint64_t v) {
+-  return v == 0 ? 64 : static_cast<uint8_t>(__builtin_ctzll(v));
+-}
+-
+-bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index) {
+-  int i = ffs(v);
+-  *out_first_set_index = i - 1;
+-  return i != 0;
+-}
+-bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index) {
+-  int i = __builtin_ffsll(v);
+-  *out_first_set_index = i - 1;
+-  return i != 0;
+-}
+-
+-}  // namespace rex
++// lzcnt, tzcnt and bit_scan_forward are defined inline in rex/math.h.
+diff --git a/src/core/math_msvc.cpp b/src/core/math_msvc.cpp
+index d9afc56..bc46f6d 100644
+--- a/src/core/math_msvc.cpp
++++ b/src/core/math_msvc.cpp
+@@ -3,65 +3,4 @@
+ 
+ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
+ 
+-#include <intrin.h>
+-
+-namespace rex {
+-
+-uint8_t lzcnt(uint8_t v) {
+-  unsigned long index;
+-  unsigned long mask = v;
+-  unsigned char is_nonzero = _BitScanReverse(&index, mask);
+-  return static_cast<uint8_t>(is_nonzero ? int8_t(index) ^ 0x7 : 8);
+-}
+-uint8_t lzcnt(uint16_t v) {
+-  unsigned long index;
+-  unsigned long mask = v;
+-  unsigned char is_nonzero = _BitScanReverse(&index, mask);
+-  return static_cast<uint8_t>(is_nonzero ? int8_t(index) ^ 0xF : 16);
+-}
+-uint8_t lzcnt(uint32_t v) {
+-  unsigned long index;
+-  unsigned long mask = v;
+-  unsigned char is_nonzero = _BitScanReverse(&index, mask);
+-  return static_cast<uint8_t>(is_nonzero ? int8_t(index) ^ 0x1F : 32);
+-}
+-uint8_t lzcnt(uint64_t v) {
+-  unsigned long index;
+-  unsigned long long mask = v;
+-  unsigned char is_nonzero = _BitScanReverse64(&index, mask);
+-  return static_cast<uint8_t>(is_nonzero ? int8_t(index) ^ 0x3F : 64);
+-}
+-
+-uint8_t tzcnt(uint8_t v) {
+-  unsigned long index;
+-  unsigned long mask = v;
+-  unsigned char is_nonzero = _BitScanForward(&index, mask);
+-  return static_cast<uint8_t>(is_nonzero ? int8_t(index) : 8);
+-}
+-uint8_t tzcnt(uint16_t v) {
+-  unsigned long index;
+-  unsigned long mask = v;
+-  unsigned char is_nonzero = _BitScanForward(&index, mask);
+-  return static_cast<uint8_t>(is_nonzero ? int8_t(index) : 16);
+-}
+-uint8_t tzcnt(uint32_t v) {
+-  unsigned long index;
+-  unsigned long mask = v;
+-  unsigned char is_nonzero = _BitScanForward(&index, mask);
+-  return static_cast<uint8_t>(is_nonzero ? int8_t(index) : 32);
+-}
+-uint8_t tzcnt(uint64_t v) {
+-  unsigned long index;
+-  unsigned long long mask = v;
+-  unsigned char is_nonzero = _BitScanForward64(&index, mask);
+-  return static_cast<uint8_t>(is_nonzero ? int8_t(index) : 64);
+-}
+-
+-bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index) {
+-  return _BitScanForward(reinterpret_cast<unsigned long*>(out_first_set_index), v) != 0;
+-}
+-bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index) {
+-  return _BitScanForward64(reinterpret_cast<unsigned long*>(out_first_set_index), v) != 0;
+-}
+-
+-}  // namespace rex
++// lzcnt, tzcnt and bit_scan_forward are defined inline in rex/math.h.
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 4c2cbe2..fd240bf 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -41,6 +41,12 @@
+ REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(d3d12_draw_state_cache, true, "GPU/D3D12",
++                    "Skip recomputing per-draw sampler parameters, texture descriptor checks and "
++                    "texture state transitions when their inputs are the same as in the previous "
++                    "draw")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
+                     "Read data written by memory export in shaders on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -4226,6 +4232,111 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
+     xenos::Endian index_endian, const draw_util::ViewportInfo& viewport_info,
+     uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
+     uint32_t normalized_color_mask) {
++  if (!REXCVAR_GET(d3d12_draw_state_cache)) {
++    system_constants_inputs_valid_ = false;
++    UpdateSystemConstantValuesImpl(shared_memory_is_uav, primitive_polygonal,
++                                   line_loop_closing_index, index_endian, viewport_info,
++                                   used_texture_mask, normalized_depth_control,
++                                   normalized_color_mask);
++    return;
++  }
++
++  // Everything UpdateSystemConstantValuesImpl reads. Keep in sync with it.
++  const RegisterFile& regs = *register_file_;
++  SystemConstantsInputs inputs;
++  static constexpr uint32_t kInputRegisters[] = {
++      XE_GPU_REG_PA_CL_CLIP_CNTL,
++      XE_GPU_REG_PA_CL_VTE_CNTL,
++      XE_GPU_REG_PA_SU_SC_MODE_CNTL,
++      XE_GPU_REG_RB_ALPHA_REF,
++      XE_GPU_REG_RB_COLORCONTROL,
++      XE_GPU_REG_RB_DEPTH_INFO,
++      XE_GPU_REG_RB_STENCILREFMASK,
++      XE_GPU_REG_RB_STENCILREFMASK_BF,
++      XE_GPU_REG_RB_SURFACE_INFO,
++      XE_GPU_REG_SQ_CONTEXT_MISC,
++      XE_GPU_REG_SQ_PROGRAM_CNTL,
++      XE_GPU_REG_VGT_INDX_OFFSET,
++      XE_GPU_REG_VGT_MAX_VTX_INDX,
++      XE_GPU_REG_VGT_MIN_VTX_INDX,
++      XE_GPU_REG_VGT_HOS_MIN_TESS_LEVEL,
++      XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL,
++      XE_GPU_REG_VGT_OUTPUT_PATH_CNTL,
++      XE_GPU_REG_PA_SU_POINT_MINMAX,
++      XE_GPU_REG_PA_SU_POINT_SIZE,
++      XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE,
++      XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET,
++      XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE,
++      XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET,
++      XE_GPU_REG_RB_BLEND_RED,
++      XE_GPU_REG_RB_BLEND_GREEN,
++      XE_GPU_REG_RB_BLEND_BLUE,
++      XE_GPU_REG_RB_BLEND_ALPHA,
++  };
++  static_assert(std::size(kInputRegisters) + 4 + 4 == std::size(inputs.registers));
++  uint32_t* input_register = inputs.registers;
++  for (uint32_t register_index : kInputRegisters) {
++    *(input_register++) = regs[register_index];
++  }
++  for (uint32_t i = 0; i < 4; ++i) {
++    *(input_register++) = regs[reg::RB_COLOR_INFO::rt_register_indices[i]];
++    *(input_register++) = regs[reg::RB_BLENDCONTROL::rt_register_indices[i]];
++  }
++  std::memcpy(inputs.user_clip_planes, &regs[XE_GPU_REG_PA_CL_UCP_0_X],
++              sizeof(inputs.user_clip_planes));
++  inputs.flags =
++      uint32_t(shared_memory_is_uav) | (uint32_t(primitive_polygonal) << 1) |
++      (uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type) << 2) |
++      (uint32_t(render_target_cache_->GetPath()) << 8) |
++      (uint32_t(render_target_cache_->gamma_render_target_as_unorm16()) << 12) |
++      (uint32_t(render_target_cache_->IsFixed16TruncatedToMinus1To1()) << 13) |
++      (texture_cache_->draw_resolution_scale_x() << 16) |
++      (texture_cache_->draw_resolution_scale_y() << 24);
++  inputs.line_loop_closing_index = line_loop_closing_index;
++  inputs.index_endian = uint32_t(index_endian);
++  inputs.used_texture_mask = used_texture_mask;
++  inputs.normalized_depth_control = normalized_depth_control.value;
++  inputs.normalized_color_mask = normalized_color_mask;
++  for (uint32_t i = 0; i < 3; ++i) {
++    inputs.ndc_scale[i] = viewport_info.ndc_scale[i];
++    inputs.ndc_offset[i] = viewport_info.ndc_offset[i];
++  }
++  inputs.xy_extent[0] = viewport_info.xy_extent[0];
++  inputs.xy_extent[1] = viewport_info.xy_extent[1];
++  // Signedness and resolution scaling of the used textures.
++  std::memset(inputs.texture_swizzled_signs, 0, sizeof(inputs.texture_swizzled_signs));
++  inputs.textures_resolution_scaled = 0;
++  uint32_t textures_remaining = used_texture_mask;
++  uint32_t texture_index;
++  while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
++    textures_remaining &= ~(uint32_t(1) << texture_index);
++    inputs.texture_swizzled_signs[texture_index >> 2] |=
++        uint32_t(texture_cache_->GetActiveTextureSwizzledSigns(texture_index))
++        << ((texture_index & 3) * 8);
++    inputs.textures_resolution_scaled |=
++        uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
++  }
++
++  bool inputs_same = system_constants_inputs_valid_ &&
++                     !std::memcmp(&inputs, &system_constants_inputs_, sizeof(inputs));
++  if (inputs_same && !REXCVAR_GET(gpu_draw_state_cache_validate)) {
++    return;
++  }
++  bool changed = UpdateSystemConstantValuesImpl(
++      shared_memory_is_uav, primitive_polygonal, line_loop_closing_index, index_endian,
++      viewport_info, used_texture_mask, normalized_depth_control, normalized_color_mask);
++  if (inputs_same && changed && draw_state_cache_mismatches_++ < 16) {
++    REXGPU_WARN("d3d12_draw_state_cache: system constants changed with the same inputs");
++  }
++  system_constants_inputs_ = inputs;
++  system_constants_inputs_valid_ = true;
++}
++
++bool D3D12CommandProcessor::UpdateSystemConstantValuesImpl(
++    bool shared_memory_is_uav, bool primitive_polygonal, uint32_t line_loop_closing_index,
++    xenos::Endian index_endian, const draw_util::ViewportInfo& viewport_info,
++    uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
++    uint32_t normalized_color_mask) {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -4640,6 +4751,71 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
+   }
+ 
+   cbuffer_binding_system_.up_to_date &= !dirty;
++  return dirty;
++}
++
++bool D3D12CommandProcessor::UpdateSamplerParameters(
++    const std::vector<D3D12Shader::SamplerBinding>& samplers,
++    std::vector<D3D12TextureCache::SamplerParameters>& current_samplers,
++    std::vector<SamplerParametersInputs>& current_inputs, bool use_cache, bool validate,
++    int32_t anisotropic_override) {
++  size_t sampler_count = samplers.size();
++  current_samplers.resize(std::max(current_samplers.size(), sampler_count));
++  bool changed = false;
++  if (!use_cache) {
++    // Not maintained while off, so nothing stale is used when turned on.
++    current_inputs.clear();
++    for (size_t i = 0; i < sampler_count; ++i) {
++      D3D12TextureCache::SamplerParameters parameters =
++          texture_cache_->GetSamplerParameters(samplers[i]);
++      if (current_samplers[i] != parameters) {
++        current_samplers[i] = parameters;
++        changed = true;
++      }
++    }
++    return changed;
++  }
++  if (current_inputs.size() < sampler_count) {
++    SamplerParametersInputs unknown_inputs = {};
++    unknown_inputs.binding = UINT32_MAX;
++    current_inputs.resize(sampler_count, unknown_inputs);
++  }
++  const uint32_t* fetch_constants = &register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
++  for (size_t i = 0; i < sampler_count; ++i) {
++    const D3D12Shader::SamplerBinding& sampler = samplers[i];
++    uint32_t binding_bits = sampler.fetch_constant | (uint32_t(sampler.mag_filter) << 8) |
++                            (uint32_t(sampler.min_filter) << 12) |
++                            (uint32_t(sampler.mip_filter) << 16) |
++                            (uint32_t(sampler.aniso_filter) << 20);
++    const uint32_t* fetch = fetch_constants + sampler.fetch_constant * 6;
++    SamplerParametersInputs& inputs = current_inputs[i];
++    if (inputs.binding == binding_bits && inputs.anisotropic_override == anisotropic_override &&
++        !std::memcmp(inputs.fetch, fetch, sizeof(inputs.fetch))) {
++      // current_samplers[i] was computed from exactly these inputs.
++      if (validate) {
++        D3D12TextureCache::SamplerParameters parameters =
++            texture_cache_->GetSamplerParameters(sampler);
++        if (parameters != current_samplers[i]) {
++          if (draw_state_cache_mismatches_++ < 16) {
++            REXGPU_WARN("d3d12_draw_state_cache: sampler {} parameters {:08X} instead of {:08X}",
++                        sampler.fetch_constant, current_samplers[i].value, parameters.value);
++          }
++          current_samplers[i] = parameters;
++          changed = true;
++        }
++      }
++      continue;
++    }
++    D3D12TextureCache::SamplerParameters parameters = texture_cache_->GetSamplerParameters(sampler);
++    if (current_samplers[i] != parameters) {
++      current_samplers[i] = parameters;
++      changed = true;
++    }
++    std::memcpy(inputs.fetch, fetch, sizeof(inputs.fetch));
++    inputs.binding = binding_bits;
++    inputs.anisotropic_override = anisotropic_override;
++  }
++  return changed;
+ }
+ 
+ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+@@ -4654,6 +4830,10 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++  bool draw_state_cache = REXCVAR_GET(d3d12_draw_state_cache);
++  bool draw_state_cache_validate = draw_state_cache && REXCVAR_GET(gpu_draw_state_cache_validate);
++  int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
++
+   // Set the new root signature.
+   if (current_graphics_root_signature_ != root_signature) {
+     current_graphics_root_signature_ = root_signature;
+@@ -4846,16 +5026,11 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+       cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+       bindful_samplers_written_vertex_ = false;
+     }
+-    current_samplers_vertex_.resize(
+-        std::max(current_samplers_vertex_.size(), sampler_count_vertex));
+-    for (size_t i = 0; i < sampler_count_vertex; ++i) {
+-      D3D12TextureCache::SamplerParameters parameters =
+-          texture_cache_->GetSamplerParameters(samplers_vertex[i]);
+-      if (current_samplers_vertex_[i] != parameters) {
+-        cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+-        bindful_samplers_written_vertex_ = false;
+-        current_samplers_vertex_[i] = parameters;
+-      }
++    if (UpdateSamplerParameters(samplers_vertex, current_samplers_vertex_,
++                                current_sampler_inputs_vertex_, draw_state_cache,
++                                draw_state_cache_validate, anisotropic_override)) {
++      cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
++      bindful_samplers_written_vertex_ = false;
+     }
+   }
+ 
+@@ -4878,16 +5053,11 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+         cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+         bindful_samplers_written_pixel_ = false;
+       }
+-      current_samplers_pixel_.resize(
+-          std::max(current_samplers_pixel_.size(), size_t(sampler_count_pixel)));
+-      for (uint32_t i = 0; i < sampler_count_pixel; ++i) {
+-        D3D12TextureCache::SamplerParameters parameters =
+-            texture_cache_->GetSamplerParameters((*samplers_pixel)[i]);
+-        if (current_samplers_pixel_[i] != parameters) {
+-          current_samplers_pixel_[i] = parameters;
+-          cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+-          bindful_samplers_written_pixel_ = false;
+-        }
++      if (UpdateSamplerParameters(*samplers_pixel, current_samplers_pixel_,
++                                  current_sampler_inputs_pixel_, draw_state_cache,
++                                  draw_state_cache_validate, anisotropic_override)) {
++        cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
++        bindful_samplers_written_pixel_ = false;
+       }
+     }
+   } else {
+@@ -4908,18 +5078,42 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+ 
+     // Check if need to write new descriptor indices.
+     // Samplers have already been checked.
++    // With d3d12_draw_state_cache, the texture SRV keys are known to be up to
++    // date while no texture binding has changed since they were last written or
++    // checked with the same layout.
++    uint64_t texture_bindings_version = texture_cache_->texture_bindings_version();
++    auto texture_srv_keys_up_to_date =
++        [&](const std::vector<D3D12TextureCache::TextureSRVKey>& keys,
++            const D3D12Shader::TextureBinding* bindings, size_t count,
++            uint64_t& keys_bindings_version) {
++          if (draw_state_cache && keys_bindings_version == texture_bindings_version) {
++            if (draw_state_cache_validate && !texture_cache_->AreActiveTextureSRVKeysUpToDate(
++                                                 keys.data(), bindings, count)) {
++              if (draw_state_cache_mismatches_++ < 16) {
++                REXGPU_WARN("d3d12_draw_state_cache: texture SRV keys not up to date");
++              }
++              return false;
++            }
++            return true;
++          }
++          if (!texture_cache_->AreActiveTextureSRVKeysUpToDate(keys.data(), bindings, count)) {
++            return false;
++          }
++          keys_bindings_version = draw_state_cache ? texture_bindings_version : UINT64_MAX;
++          return true;
++        };
+     if (texture_count_vertex && cbuffer_binding_descriptor_indices_vertex_.up_to_date &&
+         (current_texture_layout_uid_vertex_ != texture_layout_uid_vertex ||
+-         !texture_cache_->AreActiveTextureSRVKeysUpToDate(current_texture_srv_keys_vertex_.data(),
+-                                                          textures_vertex.data(),
+-                                                          texture_count_vertex))) {
++         !texture_srv_keys_up_to_date(current_texture_srv_keys_vertex_, textures_vertex.data(),
++                                      texture_count_vertex,
++                                      texture_srv_keys_bindings_version_vertex_))) {
+       cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
+     }
+     if (texture_count_pixel && cbuffer_binding_descriptor_indices_pixel_.up_to_date &&
+         (current_texture_layout_uid_pixel_ != texture_layout_uid_pixel ||
+-         !texture_cache_->AreActiveTextureSRVKeysUpToDate(current_texture_srv_keys_pixel_.data(),
+-                                                          textures_pixel->data(),
+-                                                          texture_count_pixel))) {
++         !texture_srv_keys_up_to_date(current_texture_srv_keys_pixel_, textures_pixel->data(),
++                                      texture_count_pixel,
++                                      texture_srv_keys_bindings_version_pixel_))) {
+       cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
+     }
+ 
+@@ -5049,6 +5243,8 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+             std::max(current_texture_srv_keys_vertex_.size(), size_t(texture_count_vertex)));
+         texture_cache_->WriteActiveTextureSRVKeys(current_texture_srv_keys_vertex_.data(),
+                                                   textures_vertex.data(), texture_count_vertex);
++        texture_srv_keys_bindings_version_vertex_ =
++            draw_state_cache ? texture_bindings_version : UINT64_MAX;
+       }
+       // Current samplers have already been updated.
+       for (size_t i = 0; i < sampler_count_vertex; ++i) {
+@@ -5080,6 +5276,8 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+             std::max(current_texture_srv_keys_pixel_.size(), size_t(texture_count_pixel)));
+         texture_cache_->WriteActiveTextureSRVKeys(current_texture_srv_keys_pixel_.data(),
+                                                   textures_pixel->data(), texture_count_pixel);
++        texture_srv_keys_bindings_version_pixel_ =
++            draw_state_cache ? texture_bindings_version : UINT64_MAX;
+       }
+       // Current samplers have already been updated.
+       for (size_t i = 0; i < sampler_count_pixel; ++i) {
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index d9da85e..9cffe88 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -712,6 +712,51 @@ void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
+ 
+   TextureCache::RequestTextures(used_texture_mask);
+ 
++  // With d3d12_draw_state_cache, the rest (3D-as-2D wrappers, marking the
++  // textures as used and transitioning them) is skipped if it has already been
++  // done for all of these textures in this submission, and no texture has
++  // changed its state since then, so it would have no effect.
++  bool skip_transitions = false;
++  if (REXCVAR_GET(d3d12_draw_state_cache)) {
++    skip_transitions = textures_transitioned_valid_ &&
++                       !(used_texture_mask & ~textures_transitioned_mask_) &&
++                       textures_transitioned_bindings_version_ == texture_bindings_version() &&
++                       textures_transitioned_submission_ == current_submission_index() &&
++                       textures_transitioned_state_changes_ == texture_state_changes_;
++    if (skip_transitions && REXCVAR_GET(gpu_draw_state_cache_validate)) {
++      uint32_t check_remaining = used_texture_mask;
++      uint32_t check_index;
++      while (rex::bit_scan_forward(check_remaining, &check_index)) {
++        check_remaining &= ~(uint32_t(1) << check_index);
++        const TextureBinding* binding = GetValidTextureBinding(check_index);
++        if (!binding) {
++          continue;
++        }
++        for (Texture* texture : {binding->texture, binding->texture_signed}) {
++          if (!texture) {
++            continue;
++          }
++          D3D12Texture* d3d12_texture = static_cast<D3D12Texture*>(texture);
++          if (d3d12_texture->last_usage_submission_index() != current_submission_index() ||
++              d3d12_texture->GetResourceState() != (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
++                                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) {
++            if (draw_state_cache_mismatches_++ < 16) {
++              REXGPU_WARN("d3d12_draw_state_cache: texture transition skipped for texture {} "
++                          "not in the shader resource state or not used in the submission",
++                          static_cast<void*>(texture));
++            }
++            skip_transitions = false;
++          }
++        }
++      }
++    }
++  } else {
++    textures_transitioned_valid_ = false;
++  }
++  if (skip_transitions) {
++    return;
++  }
++
+   // Pre-create 3D-as-2D wrappers before draw setup. Wrapper loading may bind
+   // compute pipelines and must happen in the texture request phase.
+   if (REXCVAR_GET(gpu_3d_to_2d_texture)) {
+@@ -772,6 +817,21 @@ void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
+               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+     }
+   }
++  // Recorded after the transitions above, which may have changed states.
++  if (textures_transitioned_valid_ &&
++      textures_transitioned_bindings_version_ == texture_bindings_version() &&
++      textures_transitioned_submission_ == current_submission_index() &&
++      textures_transitioned_state_changes_ == texture_state_changes_) {
++    // Nothing else changed since the last time: the earlier textures are still
++    // in the state, extend the set.
++    textures_transitioned_mask_ |= used_texture_mask;
++  } else {
++    textures_transitioned_mask_ = used_texture_mask;
++  }
++  textures_transitioned_valid_ = true;
++  textures_transitioned_bindings_version_ = texture_bindings_version();
++  textures_transitioned_submission_ = current_submission_index();
++  textures_transitioned_state_changes_ = texture_state_changes_;
+ }
+ 
+ bool D3D12TextureCache::AreActiveTextureSRVKeysUpToDate(
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 7fc44a0..16249f3 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cstdint>
++#include <cstring>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+@@ -81,6 +82,17 @@ REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
+ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
+                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
+ 
++REXCVAR_DEFINE_BOOL(gpu_texture_binding_cache, true, "GPU",
++                    "Remember texture bindings by their fetch constant, so a texture that was "
++                    "bound before is bound again without decoding the fetch constant and looking "
++                    "up the texture")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(gpu_draw_state_cache_validate, false, "GPU",
++                    "Debug: also compute everything the draw state caches "
++                    "(gpu_texture_binding_cache, d3d12_draw_state_cache) skip, and log mismatches")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ // DEFINE_int32(
+ //     draw_resolution_scale_x, 1,
+ //     "Integer pixel width scale used for scaling the rendering resolution "
+@@ -224,6 +236,11 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
+     scaled_resolve_global_watch_handle_ =
+         shared_memory.RegisterGlobalWatch(ScaledResolveGlobalWatchCallbackThunk, this);
+   }
++
++  texture_binding_memo_ = std::make_unique<TextureBindingMemoEntry[]>(
++      size_t(1) << kTextureBindingMemoSizeLog2);
++  std::memset(static_cast<void*>(texture_binding_memo_.get()), 0,
++              sizeof(TextureBindingMemoEntry) << kTextureBindingMemoSizeLog2);
+ }
+ 
+ TextureCache::~TextureCache() {
+@@ -291,6 +308,7 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
+       // doesn't imply that it's not bound currently. Reset bindings if
+       // any texture has been destroyed.
+       ResetTextureBindings();
++      InvalidateTextureBindingMemo();
+     }
+     // Remove the texture from the map and destroy it via its unique_ptr.
+     auto found_texture_it = textures_.find(texture->key());
+@@ -332,6 +350,7 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
+     uint32_t block_first = page_first >> 5;
+     uint32_t block_last = page_last >> 5;
+     auto global_lock = global_critical_region_.Acquire();
++    bool pages_added = false;
+     for (uint32_t i = block_first; i <= block_last; ++i) {
+       uint32_t add_bits = UINT32_MAX;
+       if (i == block_first) {
+@@ -340,9 +359,14 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
+       if (i == block_last && (page_last & 31) != 31) {
+         add_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
+       }
++      pages_added |= (scaled_resolve_pages_[i] & add_bits) != add_bits;
+       scaled_resolve_pages_[i] |= add_bits;
+       scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
+     }
++    // Textures in these pages may now be looked up as scaled.
++    if (pages_added) {
++      InvalidateTextureBindingMemo();
++    }
+   }
+ 
+   // Invalidate textures. Toggling individual textures between scaled and
+@@ -451,16 +475,97 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
+   return true;
+ }
+ 
++TextureCache::Texture* TextureCache::FindOrCreateTextureMemo(TextureBindingMemoEntry* memo,
++                                                             const TextureKey& key,
++                                                             bool signed_version) {
++  TextureKey lookup_key = key;
++  if (signed_version) {
++    lookup_key.signed_separate = 1;
++  }
++  if (!memo) {
++    return FindOrCreateTexture(lookup_key);
++  }
++  uint8_t looked_up_bit = signed_version ? 0b10 : 0b01;
++  Texture*& memo_texture = signed_version ? memo->texture_signed : memo->texture;
++  if (memo->looked_up & looked_up_bit) {
++    if (REXCVAR_GET(gpu_draw_state_cache_validate)) {
++      Texture* texture = FindOrCreateTexture(lookup_key);
++      if (texture != memo_texture) {
++        if (texture_binding_memo_mismatches_++ < 16) {
++          REXGPU_WARN("gpu_texture_binding_cache mismatch: texture {} instead of {}",
++                      static_cast<void*>(memo_texture), static_cast<void*>(texture));
++        }
++        return texture;
++      }
++    }
++    return memo_texture;
++  }
++  Texture* texture = FindOrCreateTexture(lookup_key);
++  // A failed creation isn't remembered, so it's retried like without the memo.
++  if (texture) {
++    memo_texture = texture;
++    memo->looked_up |= looked_up_bit;
++  }
++  return texture;
++}
++
++void TextureCache::ValidateTextureBindingMemo(const TextureBindingMemoEntry& memo,
++                                              const xenos::xe_gpu_texture_fetch_t& fetch) {
++  TextureKey key;
++  uint8_t swizzled_signs;
++  BindingInfoFromFetchConstant(fetch, key, &swizzled_signs);
++  uint32_t host_swizzle =
++      key.is_valid ? GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key))
++                   : uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_0000);
++  if (key != memo.key || swizzled_signs != memo.swizzled_signs ||
++      host_swizzle != memo.host_swizzle) {
++    if (texture_binding_memo_mismatches_++ < 16) {
++      REXGPU_WARN(
++          "gpu_texture_binding_cache mismatch for fetch constant {:08X} {:08X} {:08X} {:08X} "
++          "{:08X} {:08X}",
++          fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
++          fetch.dword_5);
++    }
++  }
++}
++
+ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+   const auto& regs = register_file();
+ 
+-  if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
++  // Usually false: a relaxed load avoids a locked exchange in every draw.
++  if (texture_became_outdated_.load(std::memory_order_relaxed) &&
++      texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
+     // A texture has become outdated - make sure whether textures are outdated
+     // is rechecked in this draw and in subsequent ones to reload the new data
+     // if needed.
+     ResetTextureBindings();
+   }
+ 
++  uint32_t textures_remaining = used_texture_mask & ~texture_bindings_in_sync_;
++  if (!textures_remaining) {
++    // All used bindings are up to date - nothing to load or to update.
++    return;
++  }
++
++  bool memo_enabled = REXCVAR_GET(gpu_texture_binding_cache);
++  bool memo_validate = memo_enabled && REXCVAR_GET(gpu_draw_state_cache_validate);
++  uint32_t memo_epoch = 0;
++  if (memo_enabled) {
++    if (texture_binding_memo_disabled_since_use_) {
++      // Textures may have been destroyed while the memo was not maintained.
++      texture_binding_memo_disabled_since_use_ = false;
++      InvalidateTextureBindingMemo();
++    }
++    memo_epoch = texture_binding_memo_epoch_.load(std::memory_order_acquire);
++    if (!memo_epoch) {
++      // 0 marks empty entries; skip it on wraparound.
++      InvalidateTextureBindingMemo();
++      memo_epoch = texture_binding_memo_epoch_.load(std::memory_order_acquire);
++    }
++  } else {
++    texture_binding_memo_disabled_since_use_ = true;
++  }
++
+   // Update the texture keys and the textures.
+   uint32_t bindings_changed = 0;
+   std::vector<PendingTextureLoad> pending_texture_loads;
+@@ -485,7 +590,6 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+       pending_shared_memory_ranges.push_back(pending_ranges[i]);
+     }
+   };
+-  uint32_t textures_remaining = used_texture_mask & ~texture_bindings_in_sync_;
+   uint32_t index = 0;
+   while (rex::bit_scan_forward(textures_remaining, &index)) {
+     uint32_t index_bit = UINT32_C(1) << index;
+@@ -494,7 +598,45 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
+     TextureKey old_key = binding.key;
+     uint8_t old_swizzled_signs = binding.swizzled_signs;
+-    BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
++    uint32_t old_host_swizzle = binding.host_swizzle;
++    TextureBindingMemoEntry* memo = nullptr;
++    uint32_t new_host_swizzle;
++    if (memo_enabled) {
++      static_assert(sizeof(fetch) == sizeof(memo->fetch));
++      uint32_t fetch_words[6];
++      std::memcpy(fetch_words, &fetch, sizeof(fetch_words));
++      uint64_t hash = (uint64_t(fetch_words[1]) << 32 | fetch_words[0]) * UINT64_C(0x9E3779B97F4A7C15);
++      hash ^= (uint64_t(fetch_words[3]) << 32 | fetch_words[2]) * UINT64_C(0xC2B2AE3D27D4EB4F);
++      hash ^= (uint64_t(fetch_words[5]) << 32 | fetch_words[4]) * UINT64_C(0x165667B19E3779F9);
++      memo = &texture_binding_memo_[size_t(hash >> (64 - kTextureBindingMemoSizeLog2))];
++      if (memo->epoch == memo_epoch && !std::memcmp(memo->fetch, fetch_words, sizeof(fetch_words))) {
++        if (memo_validate) {
++          ValidateTextureBindingMemo(*memo, fetch);
++        }
++        binding.key = memo->key;
++        binding.swizzled_signs = memo->swizzled_signs;
++      } else {
++        BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
++        std::memcpy(memo->fetch, fetch_words, sizeof(fetch_words));
++        memo->epoch = memo_epoch;
++        memo->key = binding.key;
++        memo->swizzled_signs = binding.swizzled_signs;
++        memo->host_swizzle =
++            binding.key.is_valid
++                ? GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key))
++                : uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_0000);
++        memo->texture = nullptr;
++        memo->texture_signed = nullptr;
++        memo->looked_up = 0;
++      }
++      new_host_swizzle = memo->host_swizzle;
++    } else {
++      BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
++      new_host_swizzle =
++          binding.key.is_valid
++              ? GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key))
++              : uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_0000);
++    }
+     texture_bindings_in_sync_ |= index_bit;
+     if (!binding.key.is_valid) {
+       if (old_key.is_valid) {
+@@ -503,8 +645,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+       binding.Reset();
+       continue;
+     }
+-    uint32_t old_host_swizzle = binding.host_swizzle;
+-    binding.host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
++    binding.host_swizzle = new_host_swizzle;
+ 
+     // Check if need to load the unsigned and the signed versions of the texture
+     // (if the format is emulated with different host bit representations for
+@@ -529,7 +670,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+       // load).
+       if (any_sign_is_not_signed) {
+         if (key_changed || !any_sign_was_not_signed) {
+-          binding.texture = FindOrCreateTexture(binding.key);
++          binding.texture = FindOrCreateTextureMemo(memo, binding.key, false);
+           load_unsigned_data = true;
+         }
+       } else {
+@@ -537,9 +678,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+       }
+       if (any_sign_is_signed) {
+         if (key_changed || !any_sign_was_signed) {
+-          TextureKey signed_key = binding.key;
+-          signed_key.signed_separate = 1;
+-          binding.texture_signed = FindOrCreateTexture(signed_key);
++          binding.texture_signed = FindOrCreateTextureMemo(memo, binding.key, true);
+           load_signed_data = true;
+         }
+       } else {
+@@ -549,7 +688,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+       // Same resource for both unsigned and signed, but descriptor formats may
+       // be different.
+       if (key_changed) {
+-        binding.texture = FindOrCreateTexture(binding.key);
++        binding.texture = FindOrCreateTextureMemo(memo, binding.key, false);
+         load_unsigned_data = true;
+       }
+       binding.texture_signed = nullptr;
+@@ -590,6 +729,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+     }
+   }
+   if (bindings_changed) {
++    ++texture_bindings_version_;
+     UpdateTextureBindingsImpl(bindings_changed);
+   }
+ }
+@@ -758,6 +898,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
+ 
+ void TextureCache::DestroyAllTextures(bool from_destructor) {
+   ResetTextureBindings(from_destructor);
++  InvalidateTextureBindingMemo();
+   textures_.clear();
+   COUNT_profile_set("gpu/texture_cache/textures", 0);
+ }
+@@ -1015,6 +1156,9 @@ void TextureCache::ResetTextureBindings(bool from_destructor) {
+     bindings_reset |= UINT32_C(1) << i;
+   }
+   texture_bindings_in_sync_ &= ~bindings_reset;
++  if (bindings_reset) {
++    ++texture_bindings_version_;
++  }
+   if (!from_destructor && bindings_reset) {
+     UpdateTextureBindingsImpl(bindings_reset);
+   }
+@@ -1126,6 +1270,7 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
+   uint32_t resolve_block_last = resolve_page_last >> 5;
+   uint32_t resolve_l2_block_first = resolve_block_first >> 6;
+   uint32_t resolve_l2_block_last = resolve_block_last >> 6;
++  bool pages_removed = false;
+   for (uint32_t i = resolve_l2_block_first; i <= resolve_l2_block_last; ++i) {
+     uint64_t resolve_l2_block = scaled_resolve_pages_l2_[i];
+     if (REXCVAR_GET(pre_mask_resolve_l2_block)) {
+@@ -1148,12 +1293,19 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
+       if (resolve_block_index == resolve_block_last && (resolve_page_last & 31) != 31) {
+         resolve_keep_bits |= ~((UINT32_C(1) << ((resolve_page_last & 31) + 1)) - 1);
+       }
++      uint32_t resolve_pages_old = scaled_resolve_pages_[resolve_block_index];
++      pages_removed |= (resolve_pages_old & resolve_keep_bits) != resolve_pages_old;
+       scaled_resolve_pages_[resolve_block_index] &= resolve_keep_bits;
+       if (scaled_resolve_pages_[resolve_block_index] == 0) {
+         scaled_resolve_pages_l2_[i] &= ~(UINT64_C(1) << resolve_block_relative_index);
+       }
+     }
+   }
++  // Textures in these pages are now looked up as unscaled. This may run on any
++  // thread, the memo epoch is atomic.
++  if (pages_removed) {
++    InvalidateTextureBindingMemo();
++  }
+ }
+ 
+ }  // namespace rex::graphics

@@ -493,12 +493,67 @@ SETTINGS (skate2.toml)
    to "= false" in skate2.toml. Saving in the settings panel or in F4
    rewrites skate2.toml with the settings in effect.
 
+   The game also turns off the runtime's frame-end memory page refresh
+   (clear_memory_page_state) by default. With it on, about 15 MB of game
+   memory was uploaded again every frame, and on the test PC the GPU's
+   work per frame was almost three times higher. If geometry, textures or
+   effects look stale, flicker or go missing, add the launch option
+     %command% --clear_memory_page_state=true
+   and report where it happened.
+
 LAUNCH OPTIONS (optional)
    A Steam launch option overrides skate2.toml at every start. Write
    %command% followed by --name=value, for example:
      %command% --async_shader_compilation=false
    The settings panel marks such settings (L). Remove the option again to
    return to the saved value.
+
+MEASURING FPS ON THE DECK
+   The Performance tab of the Quick Access menu (... button) shows the
+   frame rate; overlay level 4 adds CPU and GPU load. To find out what
+   limits the frame rate, set the launch options to
+     %command% --skate2_frame_rate=unlimited --gpu_cpu_profile=true --d3d12_gpu_timestamp_buckets=true
+   play for a minute in a busy part of the city, quit, and keep the newest
+   skate2_NNN.log from the logs folder. Every 120 frames it holds three
+   lines starting with "GPU profile": the average frame time with a
+   limit= hint (gpu, command_thread, submission_thread, guest or mixed),
+   the time of each stage, and the GPU's own execution time. Unlimited
+   mode keeps 60 FPS mode from rounding slow frames down to 30 FPS during
+   the measurement. Remove the options afterwards: the CPU profile adds a
+   little work to every draw.
+   To see where the GPU's time goes, add --d3d12_gpu_pass_profile=true.
+   Every 120 frames the log then also holds lines starting with "GPU pass
+   profile": GPU time per kind of work (draws by render target size,
+   resolves, render target transfers, texture loads, uploads, frame end),
+   the cost of passes by their number of draws, and the 10 most expensive
+   render passes.
+   Render target transfers (copies of the GPU's framebuffer memory between
+   layouts) are skipped where the next draw replaces the whole area, such
+   as full-screen clears (on by default). To compare, add
+     --gpu_render_target_transfer_skip_overwritten=false
+   To check it, add
+     --gpu_render_target_transfer_skip_overwritten_validate=true
+   If anything then turns magenta or geometry goes missing, a skipped area
+   was not replaced by the draw: report where. To log what each transfer
+   copies, add --gpu_render_target_transfer_log=600 (one frame in detail
+   every 600 frames, with totals per frame).
+   The game draws its main scene in two strips that fit the console's
+   framebuffer memory, each with the full set of draws. By default it is
+   now drawn once at full height and the second strip's draws are
+   skipped: in Free Skate on the Deck, 35 to 46 FPS in the same spot. If
+   the bottom sixth of the screen looks missing, stale or wrongly shaded,
+   add
+     --gpu_tiled_scene_single_pass=false
+   to draw it strip by strip again, and report where it happened.
+   --gpu_tiled_scene_log=600 logs "Tiled scenes" lines with the draws
+   skipped per frame.
+   Experimental: at the end of every frame the game waits until the GPU
+   has finished it (about 5 ms per frame in Free Skate on the Deck).
+     --d3d12_present_idleclean_sync_lag=1 --d3d12_present_idleclean_log=600
+   lets the GPU finish one frame while the next is prepared. Turning the
+   wait off completely caused colored stripes and black surfaces, so watch
+   for those; if they appear, remove the option. The log then shows
+   "Idle-clean waits" lines with the time waited per frame.
 
 CONTROLLER AND SETTINGS PANEL
    Steam Input presents the Deck's controls to the game as an Xbox

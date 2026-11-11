@@ -1,0 +1,129 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 464bff6..f0cb86d 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -515,6 +515,21 @@ class D3D12CommandProcessor : public CommandProcessor {
+   } present_idleclean_diagnostic_;
+   bool present_idleclean_sync_enabled_ = false;
+ 
++  // d3d12_present_idleclean_log: totals since the last periodic line.
++  struct PresentIdlecleanLog {
++    uint64_t first_frame = 0;
++    uint64_t synchronized = 0;
++    uint64_t blocked = 0;
++    uint64_t waited_us = 0;
++    uint64_t max_waited_us = 0;
++    // Closed frames whose GPU work was still running at each wait.
++    uint64_t frames_in_flight = 0;
++    // Waits whose target was older than the just-closed frame because of
++    // d3d12_present_idleclean_sync_lag.
++    uint64_t lagged = 0;
++  } present_idleclean_log_;
++  void LogPresentIdleclean();
++
+   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
+ 
+   bool device_removed_ = false;
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index e2fe9f1..21364a8 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -82,6 +82,21 @@ REXCVAR_DEFINE_BOOL(d3d12_present_idleclean_sync, false, "GPU/D3D12",
+                     "between closed guest frames. Other WAIT_UNTIL cases are unchanged.")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_INT32(d3d12_present_idleclean_sync_lag, 0, "GPU/D3D12",
++                     "Experimental, with d3d12_present_idleclean_sync: how many of the most "
++                     "recently closed frames may still be running on the GPU when the "
++                     "idle-clean wait returns. 0 waits for all submitted work; 1 lets the "
++                     "GPU finish the last frame while the next one is translated; 2 adds no "
++                     "wait beyond the normal limit of frames in flight.")
++    .range(0, 2)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(d3d12_present_idleclean_log, 0, "GPU/D3D12",
++                     "Log the idle-clean waits every this many frames: waits that blocked, "
++                     "time waited, and frames still on the GPU at the wait (0 = off)")
++    .range(0, 100000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(d3d12_gpu_timestamp_buckets, false, "GPU/D3D12",
+                     "Measure GPU execution time per frame with timestamp queries (whole "
+                     "submissions, EDRAM resolves, frame-end work) and log it every 120 frames")
+@@ -2236,7 +2251,20 @@ void D3D12CommandProcessor::MaybeSynchronizePresentIdleclean(uint32_t index, uin
+   auto& stats = present_idleclean_diagnostic_;
+   ++stats.hits;
+   const uint64_t current = submission_current_;
+-  const uint64_t target = current ? current - 1 : 0;
++  uint64_t target = current ? current - 1 : 0;
++  // d3d12_present_idleclean_sync_lag: wait only for an older closed frame,
++  // leaving the most recently closed ones running on the GPU while the next
++  // frame is translated. closed_frame_submissions_ holds the last submission
++  // of each of the last kQueueFrames closed frames; frame_current_ - 1 is the
++  // one closed last, and frames are numbered from 1.
++  const uint32_t lag = uint32_t(std::clamp(REXCVAR_GET(d3d12_present_idleclean_sync_lag),
++                                           int32_t(0), int32_t(kQueueFrames - 1)));
++  if (lag && !frame_open_) {
++    target = frame_current_ > 1 + lag
++                 ? std::min(target, closed_frame_submissions_[(frame_current_ - 1 - lag) %
++                                                              kQueueFrames])
++                 : 0;
++  }
+   const uint64_t completed_before = submission_completed_;
+   const char* reason = "none";
+   uint32_t skip_bit = 0;
+@@ -2308,6 +2336,21 @@ void D3D12CommandProcessor::MaybeSynchronizePresentIdleclean(uint32_t index, uin
+     ++stats.synchronized;
+     if (actual_before >= target) ++stats.already_complete;
+     log_detail = stats.synchronized <= 8;
++
++    auto& log = present_idleclean_log_;
++    ++log.synchronized;
++    if (actual_before < target) ++log.blocked;
++    log.waited_us += waited_us;
++    log.max_waited_us = std::max(log.max_waited_us, waited_us);
++    if (target + 1 < current) ++log.lagged;
++    if (actual_before != UINT64_MAX) {
++      for (uint64_t k = 0; k < kQueueFrames && frame_current_ > 1 + k; ++k) {
++        if (closed_frame_submissions_[(frame_current_ - 1 - k) % kQueueFrames] > actual_before) {
++          ++log.frames_in_flight;
++        }
++      }
++    }
++    LogPresentIdleclean();
+   }
+   // First eight successes, each skip reason once, and at most thirty periodic
+   // summaries spanning menus and gameplay. No per-frame or unbounded log stream.
+@@ -2326,6 +2369,32 @@ void D3D12CommandProcessor::MaybeSynchronizePresentIdleclean(uint32_t index, uin
+   }
+ }
+ 
++void D3D12CommandProcessor::LogPresentIdleclean() {
++  auto& log = present_idleclean_log_;
++  const int32_t interval = REXCVAR_GET(d3d12_present_idleclean_log);
++  if (interval <= 0 || !log.first_frame) {
++    // Start a fresh window, also when the log is turned on while running.
++    log = {};
++    log.first_frame = frame_current_;
++    return;
++  }
++  const uint64_t frames = frame_current_ - log.first_frame;
++  if (frames < uint64_t(interval)) {
++    return;
++  }
++  const double per_frame = 1.0 / double(frames);
++  REXGPU_INFO(
++      "Idle-clean waits (avg per frame over {} frames): {:.2f} waits, {:.2f} blocked, {:.0f} us "
++      "waited (longest {} us), {:.2f} closed frames still on the GPU when waiting, "
++      "d3d12_present_idleclean_sync_lag {} ({:.2f} waits for an older frame)",
++      frames, double(log.synchronized) * per_frame, double(log.blocked) * per_frame,
++      double(log.waited_us) * per_frame, log.max_waited_us,
++      log.synchronized ? double(log.frames_in_flight) / double(log.synchronized) : 0.0,
++      REXCVAR_GET(d3d12_present_idleclean_sync_lag), double(log.lagged) * per_frame);
++  log = {};
++  log.first_frame = frame_current_;
++}
++
+ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
+                                                   uint32_t num_registers) {
+   if (!num_registers) {

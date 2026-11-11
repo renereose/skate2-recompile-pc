@@ -1,0 +1,800 @@
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index beee829..2b55342 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -279,6 +279,115 @@ class CommandProcessor {
+   uint64_t bin_select_ = 0xFFFFFFFFull;
+   uint64_t bin_mask_ = 0xFFFFFFFFull;
+ 
++  // gpu_tiled_scene_single_pass: Direct3D 9 predicated tiling replays the
++  // recorded scene once per tile, selecting the tile with PM4_SET_BIN_SELECT
++  // and predicating the draws with per-draw bin masks. In single-pass mode the
++  // first tile's draws are rendered to the full height of all tiles on the
++  // host, the replays of the scene in the later tiles are skipped, and the
++  // later tiles' resolves read their rows from below the first tile in the
++  // host render targets.
++  struct TiledSceneTile {
++    uint32_t bins;
++    int32_t window_offset_y;
++    uint32_t left, top, right, bottom;
++  };
++  static constexpr uint32_t kTiledSceneMaxTiles = 8;
++  struct TiledSceneState {
++    // Between a first-tile bin select and the all-bins one.
++    bool in_bracket = false;
++    bool in_first_tile = false;
++    // Read from the cvar at the start of the bracket.
++    bool enabled = false;
++    // Tile geometry checked (valid or not) after capturing the tiles.
++    bool geometry_checked = false;
++    bool geometry_valid = false;
++    // Skipping the replays in the later tiles.
++    bool skipping = false;
++    uint32_t first_tile_bins = 0;
++    uint32_t later_tile_bins = 0;
++    uint32_t tile_count = 0;
++    TiledSceneTile tiles[kTiledSceneMaxTiles];
++    uint32_t first_tile_bottom = 0;
++    uint32_t full_bottom = 0;
++    // The current later tile, if any.
++    const TiledSceneTile* current_tile = nullptr;
++    // Draws in the first tile limited by the tile that couldn't be extended.
++    uint32_t first_tile_not_extended = 0;
++    uint32_t first_tile_extended = 0;
++    uint32_t fallback_reason = 0;
++    // The rows below the first tile in the host render targets are cleared
++    // before the first extended draw to each, to the clear values that the
++    // first tile's resolve will clear the EDRAM to for the next tile.
++    bool precleared_depth = false;
++    bool precleared_color = false;
++    uint32_t preclear_depth_value = 0;
++    uint64_t preclear_color_value = 0;
++    // Clears (bit 0 color, bit 1 depth) done by the first tile's resolves.
++    uint32_t first_tile_resolve_clears = 0;
++    bool first_tile_resolve_clear_mismatch = false;
++  };
++  struct TiledSceneStats {
++    uint32_t frames = 0;
++    uint32_t brackets = 0;
++    uint32_t single_pass_brackets = 0;
++    uint64_t extended_draws = 0;
++    uint64_t skipped_draws = 0;
++    uint64_t shifted_resolves = 0;
++    uint64_t later_tile_kept_draws = 0;
++    uint32_t fallback_reasons = 0;
++    uint32_t last_full_bottom = 0;
++    uint32_t last_first_tile_bottom = 0;
++  };
++  TiledSceneState tiled_scene_;
++  TiledSceneStats tiled_scene_stats_;
++  // Per draw, for the backend: extend a scissor ending at extend_from_ to end
++  // at extend_to_ (0 if not extending).
++  uint32_t tiled_scene_extend_from_ = 0;
++  uint32_t tiled_scene_extend_to_ = 0;
++  // Per resolve, for the backend: rows to shift the resolve source down by in
++  // the host render targets (0 if not shifting).
++  uint32_t tiled_scene_resolve_shift_rows_ = 0;
++  uint32_t tiled_scene_last_select_ = 0xFFFFFFFFu;
++  uint32_t tiled_scene_bracket_id_ = 0;
++
++  void TiledSceneOnBinSelect();
++  void TiledSceneEndBracket();
++  void TiledSceneCaptureConstant(memory::RingBuffer* reader, uint32_t count);
++  void TiledSceneCheckGeometry();
++  // Returns false if the draw must be skipped.
++  bool TiledSceneBeforeDraw(bool predicated);
++  void TiledSceneOnSwap();
++  // Whether the host render targets currently bound can hold full_bottom rows.
++  virtual bool TiledSceneCanRenderTall(uint32_t /* full_bottom */) const { return false; }
++
++ public:
++  uint32_t tiled_scene_extend_from() const { return tiled_scene_extend_from_; }
++  uint32_t tiled_scene_extend_to() const { return tiled_scene_extend_to_; }
++  uint32_t tiled_scene_resolve_shift_rows() const { return tiled_scene_resolve_shift_rows_; }
++  // Changes for every tiled scene, for the backend's per-scene state.
++  uint32_t tiled_scene_bracket_id() const { return tiled_scene_bracket_id_; }
++  // Called by the backend after clearing the rows below the first tile.
++  void TiledScenePreCleared(bool depth, uint32_t depth_value, bool color, uint64_t color_value) {
++    if (depth) {
++      tiled_scene_.precleared_depth = true;
++      tiled_scene_.preclear_depth_value = depth_value;
++    }
++    if (color) {
++      tiled_scene_.precleared_color = true;
++      tiled_scene_.preclear_color_value = color_value;
++    }
++  }
++  // Called by the backend when a draw that had to be extended couldn't be.
++  void TiledSceneExtendFailed() {
++    ++tiled_scene_.first_tile_not_extended;
++  }
++  void TiledSceneExtended() {
++    ++tiled_scene_.first_tile_extended;
++    ++tiled_scene_stats_.extended_draws;
++  }
++
++ protected:
++
+   Shader* active_vertex_shader_ = nullptr;
+   Shader* active_pixel_shader_ = nullptr;
+ 
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 9971bde..464bff6 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -286,6 +286,10 @@ class D3D12CommandProcessor : public CommandProcessor {
+   bool IssueDrawImpl(xenos::PrimitiveType primitive_type, uint32_t index_count,
+                      IndexBufferInfo* index_buffer_info, bool major_mode_explicit);
+   bool IssueCopy() override;
++  bool TiledSceneCanRenderTall(uint32_t full_bottom) const override;
++  // gpu_tiled_scene_single_pass: whether the host render targets for the
++  // current surface pitch and MSAA can hold rows up to `bottom`.
++  bool TiledSceneRenderTargetsHoldRows(uint32_t bottom) const;
+ 
+   void InitializeTrace() override;
+ 
+diff --git a/include/rex/graphics/d3d12/render_target_cache.h b/include/rex/graphics/d3d12/render_target_cache.h
+index adba2b8..3448977 100644
+--- a/include/rex/graphics/d3d12/render_target_cache.h
++++ b/include/rex/graphics/d3d12/render_target_cache.h
+@@ -81,6 +81,13 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+                D3D12TextureCache& texture_cache, uint32_t& written_address_out,
+                uint32_t& written_length_out);
+ 
++  // gpu_tiled_scene_single_pass: before a first-tile draw extended down to
++  // to_row, clears rows from_row to to_row of its depth and color 0 render
++  // targets, once per tiled scene, to RB_DEPTH_CLEAR and RB_COLOR_CLEAR - the
++  // EDRAM contents the later tiles start with after the first tile's resolve.
++  // Returns false if the draw's render targets can't be prepared this way.
++  bool TiledScenePrepareRowsBelowFirstTile(uint32_t from_row, uint32_t to_row);
++
+   // For starting a GPU trace. Submits copying of the EDRAM contents to a
+   // readback buffer, returns true if anything was submitted. The submission
+   // must then be awaited before calling InitializeTraceCompleteDownloads,
+@@ -663,8 +670,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+ 
+   // Writes contents of host render targets within rectangles from
+   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
++  // source_shift_rows (gpu_tiled_scene_single_pass): read the source render
++  // targets this many guest pixel rows below the rows the EDRAM range maps to.
+   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
+-                         uint32_t dump_pitch);
++                         uint32_t dump_pitch, uint32_t source_shift_rows = 0);
+ 
+   bool use_stencil_reference_output_ = false;
+ 
+@@ -752,6 +761,13 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+ 
+   std::vector<Transfer> clear_transfers_[2];
+ 
++  // gpu_tiled_scene_single_pass: render targets with the rows below the first
++  // tile cleared in the current tiled scene.
++  uint32_t tiled_scene_prepared_bracket_ = UINT32_MAX;
++  RenderTarget* tiled_scene_prepared_depth_ = nullptr;
++  RenderTarget* tiled_scene_prepared_color_ = nullptr;
++  std::vector<Transfer> tiled_scene_no_transfers_[2];
++
+   // Temporary storage for DXBC building.
+   std::vector<uint32_t> built_shader_;
+ 
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index dc1c645..7747fe8 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -129,6 +129,17 @@ class RenderTargetCache {
+   // change afterwards.
+   Path GetPathCommon() const { return path_common_valid_ ? path_common_ : GetPath(); }
+ 
++  // Height in guest pixels of the host render targets (independent of the
++  // EDRAM base) for the surface pitch and MSAA in RB_SURFACE_INFO.
++  uint32_t GetHostRenderTargetHeightForSurface(uint32_t surface_pitch,
++                                               xenos::MsaaSamples msaa_samples) const {
++    uint32_t pitch_tiles_at_32bpp =
++        ((surface_pitch << uint32_t(msaa_samples >= xenos::MsaaSamples::k4X)) +
++         (xenos::kEdramTileWidthSamples - 1)) /
++        xenos::kEdramTileWidthSamples;
++    return GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples);
++  }
++
+   // Resolution scaling on the EDRAM side is performed by multiplying the EDRAM
+   // tile size by the resolution scale.
+   // Note: Only integer scaling factors are provided because fractional ones,
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a06c62b..afed089 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -92,6 +92,21 @@ REXCVAR_DEFINE_BOOL(gpu_cpu_profile, false, "GPU",
+                     "draw stages, resolves, submission, waits for the GPU) every 120 guest frames")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(gpu_tiled_scene_single_pass, false, "GPU",
++                    "Render scenes drawn with predicated tiling (the screen split into strips that "
++                    "fit the EDRAM) in one pass: draw the first strip to the full height in the "
++                    "host render targets and skip the replays of the scene for the other strips. "
++                    "Direct3D 12 with host render targets only. Takes effect at the next tiled "
++                    "scene.")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(gpu_tiled_scene_log, 0, "GPU",
++                     "Log predicated tiling statistics (tiled scenes, single-pass ones, extended, "
++                     "skipped and kept draws, shifted resolves, fallback reasons) every this many "
++                     "guest frames (0 = off).")
++    .range(0, 100000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU/Trace",
+                       "Folder for GPU trace (.xtr) files. Empty: logs/gpu_traces next to the "
+                       "executable.")
+@@ -1158,11 +1173,23 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+   // We also skip predicated swaps, as they are never valid (probably?).
+   if (packet & 1) {
+     bool any_pass = (bin_select_ & bin_mask_) != 0;
++    // gpu_tiled_scene_single_pass: the per-tile window offset and scissor are
++    // set by predicated constants for all tiles at the start of the first one.
++    if (tiled_scene_.in_first_tile && opcode == PM4_SET_CONSTANT) [[unlikely]] {
++      TiledSceneCaptureConstant(reader, count);
++    }
+     if (!any_pass || opcode == PM4_XE_SWAP) {
+       reader->AdvanceRead(count * sizeof(uint32_t));
+       return true;
+     }
+   }
++  if (tiled_scene_.in_bracket && (opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2))
++      [[unlikely]] {
++    if (!TiledSceneBeforeDraw((packet & 1) != 0)) {
++      reader->AdvanceRead(count * sizeof(uint32_t));
++      return true;
++    }
++  }
+ 
+   bool result = false;
+   switch (opcode) {
+@@ -1253,11 +1280,13 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+     case PM4_SET_BIN_SELECT_LO: {
+       uint32_t value = reader->ReadAndSwap<uint32_t>();
+       bin_select_ = (bin_select_ & 0xFFFFFFFF00000000ull) | value;
++      TiledSceneOnBinSelect();
+       result = true;
+     } break;
+     case PM4_SET_BIN_SELECT_HI: {
+       uint32_t value = reader->ReadAndSwap<uint32_t>();
+       bin_select_ = (bin_select_ & 0xFFFFFFFFull) | (static_cast<uint64_t>(value) << 32);
++      TiledSceneOnBinSelect();
+       result = true;
+     } break;
+     case PM4_SET_BIN_MASK: {
+@@ -1272,6 +1301,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+       uint64_t val_hi = reader->ReadAndSwap<uint32_t>();
+       uint64_t val_lo = reader->ReadAndSwap<uint32_t>();
+       bin_select_ = (val_hi << 32) | val_lo;
++      TiledSceneOnBinSelect();
+       result = true;
+     } break;
+     case PM4_CONTEXT_UPDATE: {
+@@ -1298,11 +1328,295 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+       break;
+   }
+ 
++  if ((tiled_scene_extend_to_ | tiled_scene_resolve_shift_rows_) != 0) [[unlikely]] {
++    tiled_scene_extend_from_ = 0;
++    tiled_scene_extend_to_ = 0;
++    tiled_scene_resolve_shift_rows_ = 0;
++  }
++
+   assert_true(reader->read_offset() ==
+               (data_start_offset + (count * sizeof(uint32_t))) % reader->capacity());
+   return result;
+ }
+ 
++void CommandProcessor::TiledSceneOnBinSelect() {
++  constexpr uint32_t kFirstTileBit = 0x80000000u;
++  uint32_t select = uint32_t(bin_select_);
++  // The high half is written separately - only react to changes of the low
++  // half, which holds the bins.
++  if (select == tiled_scene_last_select_) {
++    return;
++  }
++  tiled_scene_last_select_ = select;
++  if (select == 0xFFFFFFFFu || !select) {
++    if (tiled_scene_.in_bracket) {
++      TiledSceneEndBracket();
++    }
++    return;
++  }
++  if (select & kFirstTileBit) {
++    if (tiled_scene_.in_bracket) {
++      TiledSceneEndBracket();
++    }
++    TiledSceneState& state = tiled_scene_;
++    state = TiledSceneState();
++    ++tiled_scene_bracket_id_;
++    state.in_bracket = true;
++    state.in_first_tile = true;
++    state.enabled = REXCVAR_GET(gpu_tiled_scene_single_pass);
++    state.first_tile_bins = select & ~kFirstTileBit;
++    ++tiled_scene_stats_.brackets;
++    return;
++  }
++  TiledSceneState& state = tiled_scene_;
++  if (!state.in_bracket) {
++    return;
++  }
++  if (state.in_first_tile) {
++    // Leaving the first tile - decide whether the later tiles can be skipped.
++    state.in_first_tile = false;
++    if (state.enabled && !state.geometry_checked) {
++      TiledSceneCheckGeometry();
++    }
++    if (state.enabled && state.geometry_valid) {
++      if (!state.first_tile_extended) {
++        state.fallback_reason |= 1u << 4;
++      }
++      if (state.first_tile_not_extended) {
++        state.fallback_reason |= 1u << 5;
++      }
++      // The pre-cleared rows must start the later tiles as the first tile's
++      // resolves leave the EDRAM for them - cleared with the same values.
++      if ((state.precleared_color && !(state.first_tile_resolve_clears & 1)) ||
++          (state.precleared_depth && !(state.first_tile_resolve_clears & 2)) ||
++          (!state.precleared_color && !state.precleared_depth)) {
++        state.fallback_reason |= 1u << 6;
++      }
++      if (state.first_tile_resolve_clear_mismatch) {
++        state.fallback_reason |= 1u << 7;
++      }
++      state.skipping = !state.fallback_reason;
++      if (state.skipping) {
++        ++tiled_scene_stats_.single_pass_brackets;
++        tiled_scene_stats_.last_full_bottom = state.full_bottom;
++        tiled_scene_stats_.last_first_tile_bottom = state.first_tile_bottom;
++      }
++    }
++    tiled_scene_stats_.fallback_reasons |= state.fallback_reason;
++  }
++  state.later_tile_bins = select;
++  state.current_tile = nullptr;
++  for (uint32_t i = 0; i < state.tile_count; ++i) {
++    if (state.tiles[i].bins == select) {
++      state.current_tile = &state.tiles[i];
++      break;
++    }
++  }
++}
++
++void CommandProcessor::TiledSceneEndBracket() {
++  tiled_scene_.in_bracket = false;
++  tiled_scene_.in_first_tile = false;
++  tiled_scene_.skipping = false;
++  tiled_scene_.current_tile = nullptr;
++}
++
++void CommandProcessor::TiledSceneCaptureConstant(memory::RingBuffer* reader, uint32_t count) {
++  TiledSceneState& state = tiled_scene_;
++  // Type 4 (registers) from PA_SC_WINDOW_OFFSET: the window offset, scissor
++  // top-left and bottom-right of one tile, predicated with the tile's bins.
++  if (count < 4 || state.geometry_checked) {
++    return;
++  }
++  size_t offset = reader->read_offset();
++  uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
++  if (offset_type != ((4u << 16) | (XE_GPU_REG_PA_SC_WINDOW_OFFSET - 0x2000))) {
++    reader->set_read_offset(offset);
++    return;
++  }
++  uint32_t window_offset = reader->ReadAndSwap<uint32_t>();
++  uint32_t scissor_tl = reader->ReadAndSwap<uint32_t>();
++  uint32_t scissor_br = reader->ReadAndSwap<uint32_t>();
++  reader->set_read_offset(offset);
++  uint32_t bins = uint32_t(bin_mask_);
++  for (uint32_t i = 0; i < state.tile_count; ++i) {
++    if (state.tiles[i].bins == bins) {
++      return;
++    }
++  }
++  if (state.tile_count >= kTiledSceneMaxTiles) {
++    state.fallback_reason |= 1u << 0;
++    return;
++  }
++  auto sign_extend_15 = [](uint32_t value) -> int32_t {
++    value &= 0x7FFF;
++    return (value & 0x4000) ? int32_t(value) - 0x8000 : int32_t(value);
++  };
++  TiledSceneTile& tile = state.tiles[state.tile_count++];
++  tile.bins = bins;
++  tile.window_offset_y = sign_extend_15(window_offset >> 16);
++  // The X offset must be 0 - store it in left as a marker otherwise.
++  int32_t window_offset_x = sign_extend_15(window_offset);
++  tile.left = window_offset_x ? UINT32_MAX : (scissor_tl & 0x7FFF);
++  tile.top = (scissor_tl >> 16) & 0x7FFF;
++  tile.right = scissor_br & 0x7FFF;
++  tile.bottom = (scissor_br >> 16) & 0x7FFF;
++}
++
++void CommandProcessor::TiledSceneCheckGeometry() {
++  TiledSceneState& state = tiled_scene_;
++  state.geometry_checked = true;
++  state.geometry_valid = false;
++  if (state.tile_count < 2) {
++    state.fallback_reason |= 1u << 1;
++    return;
++  }
++  // Tiles stacked vertically from the top, the first one being the first
++  // tile, each one's window offset moving it to the top of the EDRAM.
++  TiledSceneTile sorted[kTiledSceneMaxTiles];
++  std::copy(state.tiles, state.tiles + state.tile_count, sorted);
++  std::sort(sorted, sorted + state.tile_count,
++            [](const TiledSceneTile& a, const TiledSceneTile& b) { return a.top < b.top; });
++  if (sorted[0].bins != state.first_tile_bins || sorted[0].top != 0) {
++    state.fallback_reason |= 1u << 2;
++    return;
++  }
++  uint32_t expected_top = 0;
++  for (uint32_t i = 0; i < state.tile_count; ++i) {
++    const TiledSceneTile& tile = sorted[i];
++    bool tile_valid = tile.left != UINT32_MAX && tile.left == sorted[0].left &&
++                      tile.right == sorted[0].right && tile.top == expected_top &&
++                      tile.bottom > tile.top && tile.window_offset_y == -int32_t(tile.top);
++    if (i) {
++      // Later tiles must have their own bins, not shared with the first tile.
++      tile_valid = tile_valid && tile.bins && !(tile.bins & state.first_tile_bins);
++    }
++    if (!tile_valid) {
++      state.fallback_reason |= 1u << 2;
++      return;
++    }
++    expected_top = tile.bottom;
++  }
++  state.first_tile_bottom = sorted[0].bottom;
++  state.full_bottom = expected_top;
++  if (!TiledSceneCanRenderTall(state.full_bottom)) {
++    state.fallback_reason |= 1u << 3;
++    return;
++  }
++  state.geometry_valid = true;
++}
++
++bool CommandProcessor::TiledSceneBeforeDraw(bool predicated) {
++  TiledSceneState& state = tiled_scene_;
++  if (!state.enabled) {
++    return true;
++  }
++  bool is_copy =
++      register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy;
++  auto window_offset = register_file_->Get<reg::PA_SC_WINDOW_OFFSET>();
++  if (state.in_first_tile) {
++    if (window_offset.window_x_offset || window_offset.window_y_offset) {
++      return true;
++    }
++    if (is_copy) {
++      // The resolves at the end of the first tile clear the EDRAM for the next
++      // tile - check that they clear to what the rows below the first tile
++      // were cleared to.
++      uint32_t copy_control = register_file_->values[XE_GPU_REG_RB_COPY_CONTROL];
++      bool clears_color = (copy_control >> 8) & 1;
++      bool clears_depth = (copy_control >> 9) & 1;
++      if (clears_color) {
++        state.first_tile_resolve_clears |= 1;
++        uint64_t color_value =
++            uint64_t(register_file_->values[XE_GPU_REG_RB_COLOR_CLEAR]) |
++            (uint64_t(register_file_->values[XE_GPU_REG_RB_COLOR_CLEAR_LO]) << 32);
++        if ((copy_control & 7) != 0 ||
++            (state.precleared_color && color_value != state.preclear_color_value)) {
++          // Only color render target 0 is pre-cleared.
++          state.first_tile_resolve_clear_mismatch = true;
++        }
++      }
++      if (clears_depth) {
++        state.first_tile_resolve_clears |= 2;
++        if (state.precleared_depth &&
++            register_file_->values[XE_GPU_REG_RB_DEPTH_CLEAR] != state.preclear_depth_value) {
++          state.first_tile_resolve_clear_mismatch = true;
++        }
++      }
++      return true;
++    }
++    if (!state.geometry_checked) {
++      // Only check the geometry once the tile constants have been seen.
++      if (!state.tile_count) {
++        return true;
++      }
++      TiledSceneCheckGeometry();
++    }
++    if (!state.geometry_valid) {
++      return true;
++    }
++    // Draws replayed in the later tiles (predicated with bins of more than the
++    // first tile, or not predicated at all) are extended to the full height.
++    if (predicated && !(uint32_t(bin_mask_) & ~state.first_tile_bins & 0x7FFFFFFFu)) {
++      return true;
++    }
++    tiled_scene_extend_from_ = state.first_tile_bottom;
++    tiled_scene_extend_to_ = state.full_bottom;
++    return true;
++  }
++  if (!state.skipping) {
++    return true;
++  }
++  const TiledSceneTile* tile = state.current_tile;
++  bool in_tile_window =
++      tile && window_offset.window_x_offset == 0 &&
++      int32_t(window_offset.window_y_offset) == tile->window_offset_y;
++  if (is_copy) {
++    // The later tile's rows were rendered below the first tile.
++    if (in_tile_window && tile->top) {
++      tiled_scene_resolve_shift_rows_ = tile->top;
++      ++tiled_scene_stats_.shifted_resolves;
++    }
++    return true;
++  }
++  if (predicated && (uint32_t(bin_mask_) & state.first_tile_bins)) {
++    // A replay of a draw already rendered at the full height in the first
++    // tile.
++    ++tiled_scene_stats_.skipped_draws;
++    return false;
++  }
++  if (in_tile_window) {
++    // Drawn only into this tile's EDRAM rows rather than the rows below the
++    // first tile in the host render targets - counted to see if this happens.
++    ++tiled_scene_stats_.later_tile_kept_draws;
++  }
++  return true;
++}
++
++void CommandProcessor::TiledSceneOnSwap() {
++  TiledSceneStats& stats = tiled_scene_stats_;
++  ++stats.frames;
++  int32_t interval = REXCVAR_GET(gpu_tiled_scene_log);
++  if (interval <= 0 || stats.frames < uint32_t(interval)) {
++    if (interval <= 0) {
++      stats = TiledSceneStats();
++    }
++    return;
++  }
++  double frames = double(stats.frames);
++  REXGPU_INFO(
++      "Tiled scenes (avg per frame over {} frames): {:.2f} tiled scenes, {:.2f} single-pass, "
++      "{:.1f} draws extended from row {} to {}, {:.1f} replayed draws skipped, {:.2f} resolves "
++      "shifted, {:.1f} later-tile draws kept, fallback reasons 0x{:X}, "
++      "gpu_tiled_scene_single_pass {}",
++      stats.frames, stats.brackets / frames, stats.single_pass_brackets / frames,
++      stats.extended_draws / frames, stats.last_first_tile_bottom, stats.last_full_bottom,
++      stats.skipped_draws / frames, stats.shifted_resolves / frames,
++      stats.later_tile_kept_draws / frames, stats.fallback_reasons,
++      REXCVAR_GET(gpu_tiled_scene_single_pass));
++  stats = TiledSceneStats();
++}
++
+ bool CommandProcessor::ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, uint32_t packet,
+                                                   uint32_t count) {
+   // initialize CP's micro-engine
+@@ -1356,6 +1670,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   }
+ #endif
+   rex::perf::Profiler::Flip();
++  TiledSceneOnSwap();
+ 
+   // Xenia-specific VdSwap hook.
+   // VdSwap will post this to tell us we need to swap the screen/fire an
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 6f2b752..e2fe9f1 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -3014,6 +3014,26 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type,
+ 
+   draw_util::Scissor scissor;
+   draw_util::GetScissor(regs, scissor);
++  // gpu_tiled_scene_single_pass: a draw of the first tile, limited by the tile,
++  // rendered down to the bottom of the last tile.
++  if (tiled_scene_extend_to_) [[unlikely]] {
++    if (scissor.offset[1] + scissor.extent[1] == tiled_scene_extend_from_ && scissor.extent[1]) {
++      // The rows below the first tile must first hold what the later tiles
++      // start with: what the first tile's resolve clears the EDRAM to.
++      if (TiledSceneRenderTargetsHoldRows(tiled_scene_extend_to_) &&
++          render_target_cache_->TiledScenePrepareRowsBelowFirstTile(tiled_scene_extend_from_,
++                                                                    tiled_scene_extend_to_)) {
++        scissor.extent[1] = tiled_scene_extend_to_ - scissor.offset[1];
++        TiledSceneExtended();
++      } else {
++        TiledSceneExtendFailed();
++      }
++    } else if (!scissor.extent[1] && scissor.offset[1] >= tiled_scene_extend_from_) {
++      // A scissor below the first tile, emptied by it - its rows below the
++      // first tile aren't known, so the later tiles can't be skipped.
++      TiledSceneExtendFailed();
++    }
++  }
+   scissor.offset[0] *= draw_resolution_scale_x;
+   scissor.offset[1] *= draw_resolution_scale_y;
+   scissor.extent[0] *= draw_resolution_scale_x;
+@@ -3587,6 +3607,23 @@ void D3D12CommandProcessor::InitializeTrace() {
+   }
+ }
+ 
++bool D3D12CommandProcessor::TiledSceneRenderTargetsHoldRows(uint32_t bottom) const {
++  if (!render_target_cache_ ||
++      render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets) {
++    return false;
++  }
++  auto rb_surface_info = register_file_->Get<reg::RB_SURFACE_INFO>();
++  if (!rb_surface_info.surface_pitch) {
++    return false;
++  }
++  return render_target_cache_->GetHostRenderTargetHeightForSurface(
++             rb_surface_info.surface_pitch, rb_surface_info.msaa_samples) >= bottom;
++}
++
++bool D3D12CommandProcessor::TiledSceneCanRenderTall(uint32_t full_bottom) const {
++  return TiledSceneRenderTargetsHoldRows(full_bottom);
++}
++
+ bool D3D12CommandProcessor::IssueCopy() {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index ea37630..b6feb50 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -1252,8 +1252,12 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
+           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
+       bool direct_resolved = false;
++      // gpu_tiled_scene_single_pass: a later tile's rows, rendered below the
++      // first tile in the host render targets - only via the dump, which can
++      // read them from there.
++      uint32_t source_shift_rows = command_processor_.tiled_scene_resolve_shift_rows();
+       if (GetPath() == Path::kHostRenderTargets) {
+-        if (REXCVAR_GET(direct_host_resolve)) {
++        if (REXCVAR_GET(direct_host_resolve) && !source_shift_rows) {
+           direct_resolved =
+               TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
+           if (direct_resolved) {
+@@ -1271,7 +1275,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+           uint32_t dump_rows;
+           uint32_t dump_pitch;
+           resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+-          if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
++          if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch,
++                                 source_shift_rows)) {
+             REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");
+             return false;
+           }
+@@ -5690,8 +5695,90 @@ bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo
+   return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+ }
+ 
++bool D3D12RenderTargetCache::TiledScenePrepareRowsBelowFirstTile(uint32_t from_row,
++                                                                 uint32_t to_row) {
++  if (GetPath() != Path::kHostRenderTargets || to_row <= from_row) {
++    return false;
++  }
++  uint32_t bracket = command_processor_.tiled_scene_bracket_id();
++  if (tiled_scene_prepared_bracket_ != bracket) {
++    tiled_scene_prepared_bracket_ = bracket;
++    tiled_scene_prepared_depth_ = nullptr;
++    tiled_scene_prepared_color_ = nullptr;
++  }
++  uint32_t bound = GetLastUpdateBoundRenderTargets();
++  // Only depth and color 0 are cleared by the first tile's resolve for the
++  // later tiles.
++  if (bound & ~uint32_t(0b11)) {
++    return false;
++  }
++  RenderTarget* const* render_targets = last_update_accumulated_render_targets();
++  RenderTarget* depth = (bound & 0b01) ? render_targets[0] : nullptr;
++  RenderTarget* color = (bound & 0b10) ? render_targets[1] : nullptr;
++  RenderTarget* clear_render_targets[2] = {};
++  if (depth && depth != tiled_scene_prepared_depth_) {
++    if (tiled_scene_prepared_depth_) {
++      // A different depth buffer within the scene.
++      return false;
++    }
++    clear_render_targets[0] = depth;
++  }
++  if (color && color != tiled_scene_prepared_color_) {
++    if (tiled_scene_prepared_color_) {
++      return false;
++    }
++    xenos::ColorRenderTargetFormat color_format = color->key().GetColorFormat();
++    if (color_format == xenos::ColorRenderTargetFormat::k_32_FLOAT ||
++        color_format == xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
++      // May need clearing by drawing, which would change the bindings.
++      return false;
++    }
++    clear_render_targets[1] = color;
++  }
++  if (!clear_render_targets[0] && !clear_render_targets[1]) {
++    return true;
++  }
++  RenderTargetKey key = (clear_render_targets[0] ? clear_render_targets[0] : clear_render_targets[1])
++                            ->key();
++  if (clear_render_targets[0] && clear_render_targets[1]) {
++    RenderTargetKey color_key = clear_render_targets[1]->key();
++    if (color_key.pitch_tiles_at_32bpp != key.pitch_tiles_at_32bpp ||
++        color_key.msaa_samples != key.msaa_samples) {
++      return false;
++    }
++  }
++  if (to_row > GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples)) {
++    return false;
++  }
++  Transfer::Rectangle clear_rectangle;
++  clear_rectangle.x_pixels = 0;
++  clear_rectangle.y_pixels = from_row;
++  clear_rectangle.width_pixels =
++      key.pitch_tiles_at_32bpp *
++      (xenos::kEdramTileWidthSamples >> uint32_t(key.msaa_samples >= xenos::MsaaSamples::k4X));
++  clear_rectangle.height_pixels = to_row - from_row;
++  const RegisterFile& regs = register_file();
++  uint64_t clear_values[2];
++  clear_values[0] = regs[XE_GPU_REG_RB_DEPTH_CLEAR];
++  clear_values[1] =
++      regs[XE_GPU_REG_RB_COLOR_CLEAR] | (uint64_t(regs[XE_GPU_REG_RB_COLOR_CLEAR_LO]) << 32);
++  PerformTransfersAndResolveClears(2, clear_render_targets, tiled_scene_no_transfers_,
++                                   clear_values, &clear_rectangle);
++  if (clear_render_targets[0]) {
++    tiled_scene_prepared_depth_ = clear_render_targets[0];
++  }
++  if (clear_render_targets[1]) {
++    tiled_scene_prepared_color_ = clear_render_targets[1];
++  }
++  command_processor_.TiledScenePreCleared(clear_render_targets[0] != nullptr,
++                                          uint32_t(clear_values[0]),
++                                          clear_render_targets[1] != nullptr, clear_values[1]);
++  return true;
++}
++
+ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
+-                                               uint32_t dump_rows, uint32_t dump_pitch) {
++                                               uint32_t dump_rows, uint32_t dump_pitch,
++                                               uint32_t source_shift_rows) {
+   assert_true(GetPath() == Path::kHostRenderTargets);
+ 
+   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+@@ -5880,11 +5967,46 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
+     constexpr uint32_t kDumpRootParameterOffsetsBit = uint32_t(1) << kDumpRootParameterOffsets;
+     DumpOffsets offsets;
+     offsets.source_base_tiles = rt_key.base_tiles;
++    // gpu_tiled_scene_single_pass: the shader takes the tile index within the
++    // source as the non-wrapped EDRAM tile index minus the source base, so
++    // moving the base back by the shift (adding a wrap to the tile index if the
++    // base goes below 0) reads the rows below, while the EDRAM destination,
++    // using the wrapped index, stays the same.
++    uint32_t shift_wrap_tiles = 0;
++    if (source_shift_rows) {
++      uint32_t shift_sample_rows =
++          source_shift_rows << uint32_t(rt_key.msaa_samples >= xenos::MsaaSamples::k2X);
++      uint32_t shift_tiles = shift_sample_rows / xenos::kEdramTileHeightSamples *
++                             rt_key.GetPitchTiles();
++      if (shift_sample_rows % xenos::kEdramTileHeightSamples ||
++          shift_tiles >= xenos::kEdramTileCount) {
++        REXGPU_ERROR(
++            "D3D12RenderTargetCache: Can't shift a resolve source by {} rows, resolving the "
++            "unshifted rows",
++            source_shift_rows);
++      } else if (rt_key.base_tiles >= shift_tiles) {
++        offsets.source_base_tiles = rt_key.base_tiles - shift_tiles;
++      } else {
++        offsets.source_base_tiles = rt_key.base_tiles + xenos::kEdramTileCount - shift_tiles;
++        shift_wrap_tiles = xenos::kEdramTileCount;
++      }
++    }
+     ResolveCopyDumpRectangle::Dispatch dispatches[ResolveCopyDumpRectangle::kMaxDispatches];
+     uint32_t dispatch_count = rectangle.GetDispatches(dump_pitch, dump_row_length_used, dispatches);
++    if (shift_wrap_tiles) {
++      for (uint32_t i = 0; i < dispatch_count; ++i) {
++        if (dump_base + dispatches[i].offset + shift_wrap_tiles >=
++            (uint32_t(1) << (xenos::kEdramBaseTilesBits + 1))) {
++          REXGPU_ERROR("D3D12RenderTargetCache: Shifted resolve source tile out of range");
++          offsets.source_base_tiles = rt_key.base_tiles;
++          shift_wrap_tiles = 0;
++          break;
++        }
++      }
++    }
+     for (uint32_t i = 0; i < dispatch_count; ++i) {
+       const ResolveCopyDumpRectangle::Dispatch& dispatch = dispatches[i];
+-      offsets.dispatch_first_tile = dump_base + dispatch.offset;
++      offsets.dispatch_first_tile = dump_base + dispatch.offset + shift_wrap_tiles;
+       if (last_offsets != offsets) {
+         last_offsets = offsets;
+         root_parameters_set &= ~kDumpRootParameterOffsetsBit;

@@ -21,6 +21,7 @@ set(SKATE2_SOURCES
     src/draw_distance.cpp
     src/settings_panel.cpp
     src/rumble_fix.cpp
+    src/draw_probe.cpp
 )
 
 if(WIN32)

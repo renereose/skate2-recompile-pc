@@ -1,0 +1,503 @@
+diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
+index 247f334..26cc6af 100644
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -43,6 +43,10 @@ REXCVAR_DECLARE(bool, native_2x_msaa);
+ REXCVAR_DECLARE(bool, snorm16_render_target_full_range);
+ REXCVAR_DECLARE(bool, mrt_edram_used_range_clamp_to_min);
+ REXCVAR_DECLARE(bool, direct_host_resolve);
++REXCVAR_DECLARE(bool, gpu_render_target_update_cache);
++
++// GPU Shared Memory
++REXCVAR_DECLARE(bool, gpu_shared_memory_valid_range_check);
+ 
+ // GPU Textures
+ REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index eb84d17..16122ca 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -124,6 +124,10 @@ class RenderTargetCache {
+   virtual ~RenderTargetCache();
+ 
+   virtual Path GetPath() const = 0;
++  // GetPath() without the virtual call, for the per-draw code of this class. The
++  // implementations choose the path before InitializeCommon, and it doesn't
++  // change afterwards.
++  Path GetPathCommon() const { return path_common_valid_ ? path_common_ : GetPath(); }
+ 
+   // Resolution scaling on the EDRAM side is performed by multiplying the EDRAM
+   // tile size by the resolution scale.
+@@ -493,7 +497,10 @@ class RenderTargetCache {
+   // false).
+   virtual bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const = 0;
+ 
+-  void ResetAccumulatedRenderTargets() { are_accumulated_render_targets_valid_ = false; }
++  void ResetAccumulatedRenderTargets() {
++    are_accumulated_render_targets_valid_ = false;
++    InvalidateUpdateMemo();
++  }
+   RenderTarget* const* last_update_accumulated_render_targets() const {
+     assert_true(GetPath() == Path::kHostRenderTargets);
+     return last_update_accumulated_render_targets_;
+@@ -690,6 +697,34 @@ class RenderTargetCache {
+   // render targets. They are reordered so for one source, all transfers are
+   // consecutive in the array.
+   std::vector<Transfer> last_update_transfers_[1 + xenos::kMaxColorRenderTargets];
++
++  // gpu_render_target_update_cache: consecutive draws usually bind the same
++  // render targets over an EDRAM range they already own. When the bindings
++  // derived from the registers are the same as for the previous successful
++  // update, the estimated height is not larger, and nothing that could change
++  // ownership, the render target set or the accumulated bindings has happened
++  // since (update_generation_ is advanced by all of that), running the update
++  // again would only find the ranges already owned (no transfers, no ownership
++  // change) and leave the used and accumulated render targets as they are.
++  struct UpdateMemo {
++    uint64_t generation;
++    uint32_t surface_info;
++    uint32_t depth_and_color_rts_used_bits;
++    uint32_t rts_are_64bpp;
++    uint32_t height_used;
++    uint32_t edram_bases[1 + xenos::kMaxColorRenderTargets];
++    uint32_t resource_formats[1 + xenos::kMaxColorRenderTargets];
++    bool interlock_barrier_only;
++    bool mrt_edram_used_range_clamp_to_min;
++  };
++  void InvalidateUpdateMemo() { ++update_generation_; }
++  Path path_common_ = Path::kHostRenderTargets;
++  bool path_common_valid_ = false;
++  uint64_t update_generation_ = 1;
++  UpdateMemo update_memo_ = {};
++  bool update_memo_valid_ = false;
++  uint64_t update_memo_validated_ = 0;
++  uint64_t update_memo_mismatches_ = 0;
+ };
+ 
+ }  // namespace rex::graphics
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index d870bf0..9024de4 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <mutex>
+ #include <utility>
+@@ -165,6 +166,22 @@ class SharedMemory {
+   uint32_t page_size_log2_;
+ 
+   bool EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length);
++  // gpu_shared_memory_valid_range_check: true if every page of a non-empty,
++  // in-bounds range is already valid and its host GPU memory is allocated, read
++  // without entering the global critical region. Only the command processor
++  // thread sets valid bits and allocates; other threads only clear valid bits
++  // (under the lock, before the guest write they precede), so a range seen as
++  // fully valid here is the same result a locked check would have given just
++  // before a concurrent invalidation.
++  bool IsRangeValidAndAllocatedUnlocked(uint32_t start, uint32_t length) const;
++  // For validating the unlocked check with gpu_draw_state_cache_validate:
++  // RequestRanges uploads, guest invalidations (a check overlapping one may
++  // legitimately differ from the locked check that follows it), and results.
++  uint64_t upload_request_count_ = 0;
++  std::atomic<uint64_t> invalidation_sequence_{0};
++  uint64_t valid_range_check_validated_ = 0;
++  uint64_t valid_range_check_concurrent_ = 0;
++  uint64_t valid_range_check_mismatches_ = 0;
+   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
+   std::vector<uint64_t> host_gpu_memory_sparse_allocated_;
+   uint32_t host_gpu_memory_sparse_allocations_ = 0;
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index 45556f2..c2297db 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -1069,8 +1069,21 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
+     case Path::kHostRenderTargets: {
+       RenderTarget* const* depth_and_color_render_targets =
+           last_update_accumulated_render_targets();
+-      PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+-                                       depth_and_color_render_targets, last_update_transfers());
++      // Without transfers (and without a resolve clear, which is not done
++      // here), PerformTransfersAndResolveClears does nothing, and it is called
++      // for every draw.
++      const std::vector<Transfer>* transfers = last_update_transfers();
++      bool any_transfers = false;
++      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
++        if (!transfers[i].empty()) {
++          any_transfers = true;
++          break;
++        }
++      }
++      if (any_transfers) {
++        PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
++                                         depth_and_color_render_targets, transfers);
++      }
+       SetCommandListRenderTargets(depth_and_color_render_targets);
+     } break;
+     case Path::kPixelShaderInterlock: {
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 953c5fd..2724cc2 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -41,6 +41,12 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
+                     "Resolve from host render targets directly to shared memory when possible")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(gpu_render_target_update_cache, true, "GPU",
++                    "Skip the render target ownership and binding update for a draw that uses "
++                    "the same render targets as the previous one, when nothing has changed "
++                    "their EDRAM ownership since")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics {
+ 
+ void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format,
+@@ -335,12 +341,16 @@ RenderTargetCache::~RenderTargetCache() {
+ 
+ void RenderTargetCache::InitializeCommon() {
+   assert_true(ownership_ranges_.empty());
++  path_common_ = GetPath();
++  path_common_valid_ = true;
++  InvalidateUpdateMemo();
+   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
+                             std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
+                                                   RenderTargetKey(), RenderTargetKey()));
+ }
+ 
+ void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
++  InvalidateUpdateMemo();
+   ownership_ranges_.clear();
+   if (!shutting_down) {
+     ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
+@@ -361,6 +371,7 @@ void RenderTargetCache::ShutdownCommon() {
+ }
+ 
+ void RenderTargetCache::ClearCache() {
++  InvalidateUpdateMemo();
+   // Keep only render targets currently owning any EDRAM data.
+   if (!render_targets_.empty()) {
+     std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> used_render_targets;
+@@ -401,7 +412,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+                                reg::RB_DEPTHCONTROL normalized_depth_control,
+                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
+   const RegisterFile& regs = register_file();
+-  bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
++  bool interlock_barrier_only = GetPathCommon() == Path::kPixelShaderInterlock;
+ 
+   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
+@@ -540,6 +551,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+   }
+ 
+   if (!depth_and_color_rts_used_bits) {
++    update_memo_valid_ = false;
+     // Nothing to bind, don't waste time on things like memexport-only draws -
+     // just check if old bindings can still be used.
+     std::memset(last_update_used_render_targets_, 0, sizeof(last_update_used_render_targets_));
+@@ -574,6 +586,93 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+                        : true,
+                    vertex_shader));
+ 
++  // gpu_render_target_update_cache (see UpdateMemo in the header).
++  bool mrt_edram_used_range_clamp = REXCVAR_GET(mrt_edram_used_range_clamp_to_min);
++  uint32_t rts_are_64bpp_used = rts_are_64bpp & depth_and_color_rts_used_bits;
++  bool update_memo_validating = false;
++  RenderTarget* validate_used_render_targets[1 + xenos::kMaxColorRenderTargets];
++  RenderTarget* validate_accumulated_render_targets[1 + xenos::kMaxColorRenderTargets];
++  bool validate_accumulated_valid = false;
++  bool interlock_barrier_requested = false;
++  if (REXCVAR_GET(gpu_render_target_update_cache) && update_memo_valid_ &&
++      update_memo_.generation == update_generation_ &&
++      update_memo_.interlock_barrier_only == interlock_barrier_only &&
++      update_memo_.surface_info == rb_surface_info.value &&
++      update_memo_.depth_and_color_rts_used_bits == depth_and_color_rts_used_bits &&
++      update_memo_.rts_are_64bpp == rts_are_64bpp_used && height_used <= update_memo_.height_used &&
++      update_memo_.mrt_edram_used_range_clamp_to_min == mrt_edram_used_range_clamp) {
++    bool memo_same = true;
++    uint32_t memo_rts_remaining = depth_and_color_rts_used_bits;
++    uint32_t memo_rt_index;
++    while (rex::bit_scan_forward(memo_rts_remaining, &memo_rt_index)) {
++      memo_rts_remaining &= ~(uint32_t(1) << memo_rt_index);
++      if (update_memo_.edram_bases[memo_rt_index] != edram_bases[memo_rt_index] ||
++          update_memo_.resource_formats[memo_rt_index] != resource_formats[memo_rt_index]) {
++        memo_same = false;
++        break;
++      }
++    }
++    if (memo_same) {
++      // The transfers have been cleared above, the used and the accumulated
++      // render targets stay the same.
++      if (!REXCVAR_GET(gpu_draw_state_cache_validate)) {
++        return true;
++      }
++      update_memo_validating = true;
++      std::memcpy(validate_used_render_targets, last_update_used_render_targets_,
++                  sizeof(validate_used_render_targets));
++      std::memcpy(validate_accumulated_render_targets, last_update_accumulated_render_targets_,
++                  sizeof(validate_accumulated_render_targets));
++      validate_accumulated_valid = are_accumulated_render_targets_valid_;
++    }
++  }
++  // Valid again only after a successful full update below.
++  update_memo_valid_ = false;
++  auto store_update_memo = [&]() {
++    update_memo_.generation = update_generation_;
++    update_memo_.interlock_barrier_only = interlock_barrier_only;
++    update_memo_.surface_info = rb_surface_info.value;
++    update_memo_.depth_and_color_rts_used_bits = depth_and_color_rts_used_bits;
++    update_memo_.rts_are_64bpp = rts_are_64bpp_used;
++    update_memo_.height_used = height_used;
++    update_memo_.mrt_edram_used_range_clamp_to_min = mrt_edram_used_range_clamp;
++    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
++      bool used = (depth_and_color_rts_used_bits & (uint32_t(1) << i)) != 0;
++      update_memo_.edram_bases[i] = used ? edram_bases[i] : 0;
++      update_memo_.resource_formats[i] = used ? resource_formats[i] : 0;
++    }
++    update_memo_valid_ = true;
++    if (update_memo_validating) {
++      bool mismatch = interlock_barrier_requested;
++      if (!interlock_barrier_only) {
++        for (size_t i = 0; i < rex::countof(last_update_transfers_); ++i) {
++          if (!last_update_transfers_[i].empty()) {
++            mismatch = true;
++          }
++        }
++        if (std::memcmp(validate_used_render_targets, last_update_used_render_targets_,
++                        sizeof(validate_used_render_targets)) ||
++            std::memcmp(validate_accumulated_render_targets,
++                        last_update_accumulated_render_targets_,
++                        sizeof(validate_accumulated_render_targets)) ||
++            validate_accumulated_valid != are_accumulated_render_targets_valid_) {
++          mismatch = true;
++        }
++      }
++      if (mismatch && update_memo_mismatches_++ < 16) {
++        REXGPU_WARN(
++            "gpu_render_target_update_cache mismatch: the full update changed the "
++            "bindings, transferred or placed a barrier (surface info {:08X}, render "
++            "targets {:X})",
++            rb_surface_info.value, depth_and_color_rts_used_bits);
++      }
++      if (!(++update_memo_validated_ & ((uint64_t(1) << 16) - 1))) {
++        REXGPU_INFO("gpu_render_target_update_cache validation: {} cache hits checked, {} mismatches",
++                    update_memo_validated_, update_memo_mismatches_);
++      }
++    }
++  };
++
+   // Sorted by EDRAM base and then by index in the pipeline - for simplicity,
+   // treat render targets placed closer to the end of the EDRAM as truncating
+   // the previous one (and in case multiple render targets are placed at the
+@@ -674,6 +773,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+       }
+     }
+     if (interlock_barrier_needed) {
++      interlock_barrier_requested = true;
+       RequestPixelShaderInterlockBarrier();
+     }
+   }
+@@ -692,6 +792,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+ 
+   if (interlock_barrier_only) {
+     // No copying transfers or render target bindings - only needed the barrier.
++    store_update_memo();
+     return true;
+   }
+ 
+@@ -758,12 +859,13 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+     are_accumulated_render_targets_valid_ = true;
+   }
+ 
++  store_update_memo();
+   return true;
+ }
+ 
+ uint32_t RenderTargetCache::GetLastUpdateBoundRenderTargets(
+     uint32_t* depth_and_color_formats_out) const {
+-  if (GetPath() != Path::kHostRenderTargets) {
++  if (GetPathCommon() != Path::kHostRenderTargets) {
+     if (depth_and_color_formats_out) {
+       std::memset(depth_and_color_formats_out, 0,
+                   sizeof(uint32_t) * (1 + xenos::kMaxColorRenderTargets));
+@@ -1126,6 +1228,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
+ 
+ void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
+   assert_true(GetPath() == Path::kPixelShaderInterlock);
++  InvalidateUpdateMemo();
+   // Clear ownership - any overlap of data written before the barrier is safe.
+   OwnershipRange empty_range(xenos::kEdramTileCount, RenderTargetKey(), RenderTargetKey(),
+                              RenderTargetKey());
+@@ -1171,6 +1274,7 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
+     }
+     // Insert even if failed to create, not to try to create again.
+     render_targets_.emplace(key, render_target);
++    InvalidateUpdateMemo();
+   }
+   return render_target;
+ }
+@@ -1185,7 +1289,8 @@ bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey des
+   if (length_tiles == 0) {
+     return false;
+   }
+-  bool host_depth_encoding_different = dest.is_depth && GetPath() == Path::kHostRenderTargets &&
++  bool host_depth_encoding_different = dest.is_depth &&
++                                       GetPathCommon() == Path::kHostRenderTargets &&
+                                        IsHostDepthEncodingDifferent(dest.GetDepthFormat());
+   auto would_require_transfers_in_extent = [&](uint32_t extent_start, uint32_t extent_end) -> bool {
+     // The map contains consecutive ranges, merged if the adjacent ones are the
+@@ -1248,9 +1353,11 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
+   if (length_tiles == 0) {
+     return;
+   }
++  InvalidateUpdateMemo();
+   uint32_t dest_pitch_tiles = dest.GetPitchTiles();
+   bool dest_is_64bpp = dest.Is64bpp();
+-  bool host_depth_encoding_different = dest.is_depth && GetPath() == Path::kHostRenderTargets &&
++  bool host_depth_encoding_different = dest.is_depth &&
++                                       GetPathCommon() == Path::kHostRenderTargets &&
+                                        IsHostDepthEncodingDifferent(dest.GetDepthFormat());
+   auto change_ownership_in_extent = [&](uint32_t extent_start, uint32_t extent_end) {
+     // The map contains consecutive ranges, merged if the adjacent ones are the
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 16249f3..2f6f15c 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -90,7 +90,9 @@ REXCVAR_DEFINE_BOOL(gpu_texture_binding_cache, true, "GPU",
+ 
+ REXCVAR_DEFINE_BOOL(gpu_draw_state_cache_validate, false, "GPU",
+                     "Debug: also compute everything the draw state caches "
+-                    "(gpu_texture_binding_cache, d3d12_draw_state_cache) skip, and log mismatches")
++                    "(gpu_texture_binding_cache, d3d12_draw_state_cache, "
++                    "gpu_shared_memory_valid_range_check, gpu_render_target_update_cache) skip, "
++                    "and log mismatches")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ // DEFINE_int32(
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 67cfd96..760ada9 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -10,16 +10,26 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+ #include <rex/bit.h>
++#include <rex/cvar.h>
+ #include <rex/dbg.h>
++#include <rex/graphics/flags.h>
+ #include <rex/graphics/shared_memory.h>
++#include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
+ 
++REXCVAR_DEFINE_BOOL(gpu_shared_memory_valid_range_check, true, "GPU",
++                    "Check whether a vertex buffer, index buffer or texture range requested by a "
++                    "draw is already uploaded without entering the global critical region, and "
++                    "skip the upload logic if it is")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics {
+ 
+ SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
+@@ -470,10 +480,85 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     return true;
+   }
+ 
++  ++upload_request_count_;
+   return UploadRanges(upload_ranges_);
+ }
+ 
++bool SharedMemory::IsRangeValidAndAllocatedUnlocked(uint32_t start, uint32_t length) const {
++  uint32_t page_first = start >> page_size_log2_;
++  uint32_t page_last = (start + length - 1) >> page_size_log2_;
++  if (host_gpu_memory_sparse_granularity_log2_ != UINT32_MAX) {
++    // Same allocation range as EnsureHostGpuMemoryAllocated.
++    uint32_t allocation_first =
++        page_first << page_size_log2_ >> host_gpu_memory_sparse_granularity_log2_;
++    uint32_t allocation_last =
++        page_last << page_size_log2_ >> host_gpu_memory_sparse_granularity_log2_;
++    const uint64_t* allocated = host_gpu_memory_sparse_allocated_.data();
++    for (uint32_t i = allocation_first; i <= allocation_last; ++i) {
++      if (!(allocated[i >> 6] & (uint64_t(1) << (i & 63)))) {
++        return false;
++      }
++    }
++  }
++  uint32_t block_first = page_first >> 6;
++  uint32_t block_last = page_last >> 6;
++  uint64_t* valid = const_cast<uint64_t*>(system_page_flags_valid_.data());
++  for (uint32_t i = block_first; i <= block_last; ++i) {
++    uint64_t needed = UINT64_MAX;
++    if (i == block_first) {
++      needed &= ~((uint64_t(1) << (page_first & 63)) - 1);
++    }
++    if (i == block_last && (page_last & 63) != 63) {
++      needed &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
++    }
++    uint64_t block_valid = std::atomic_ref<uint64_t>(valid[i]).load(std::memory_order_acquire);
++    if ((block_valid & needed) != needed) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
++  // Draws request their vertex and index buffers and textures every time, and
++  // nearly always find them already uploaded. Answer that case without the
++  // global critical region, which guest threads contend for.
++  if (length && start <= kBufferSize && (kBufferSize - start) >= length &&
++      REXCVAR_GET(gpu_shared_memory_valid_range_check)) {
++    bool validate = REXCVAR_GET(gpu_draw_state_cache_validate);
++    uint64_t invalidation_sequence_before =
++        validate ? invalidation_sequence_.load(std::memory_order_acquire) : 0;
++    if (IsRangeValidAndAllocatedUnlocked(start, length)) {
++      if (!validate) {
++        return true;
++      }
++      uint64_t upload_request_count_before = upload_request_count_;
++      std::pair<uint32_t, uint32_t> range(start, length);
++      bool result = RequestRanges(&range, 1);
++      bool uploaded = upload_request_count_ != upload_request_count_before;
++      ++valid_range_check_validated_;
++      if (invalidation_sequence_.load(std::memory_order_acquire) != invalidation_sequence_before) {
++        // A guest write was invalidating memory (possibly this range) between
++        // the two checks - either result is valid then.
++        ++valid_range_check_concurrent_;
++      } else if (uploaded) {
++        if (valid_range_check_mismatches_++ < 16) {
++          REXGPU_WARN(
++              "gpu_shared_memory_valid_range_check mismatch: 0x{:08X} (size {}) "
++              "was seen as uploaded, but the locked check uploaded it",
++              start, length);
++        }
++      }
++      if (!(valid_range_check_validated_ & ((uint64_t(1) << 18) - 1))) {
++        REXGPU_INFO(
++            "gpu_shared_memory_valid_range_check validation: {} checks, {} with "
++            "concurrent guest invalidations, {} mismatches",
++            valid_range_check_validated_, valid_range_check_concurrent_,
++            valid_range_check_mismatches_);
++      }
++      return result;
++    }
++  }
+   std::pair<uint32_t, uint32_t> range(start, length);
+   return RequestRanges(&range, 1);
+ }
+@@ -532,6 +617,7 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+     system_page_flags_valid_[i] &= ~invalidate_bits;
+     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
+   }
++  invalidation_sequence_.fetch_add(1, std::memory_order_release);
+ 
+   FireWatches(page_first, page_last, false);
+ 

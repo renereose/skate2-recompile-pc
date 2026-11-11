@@ -1,0 +1,959 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 165ad71..f881ae5 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -88,6 +88,51 @@ class D3D12CommandProcessor : public CommandProcessor {
+   uint64_t GetCurrentFrame() const { return frame_current_; }
+   uint64_t GetCompletedFrame() const { return frame_completed_; }
+ 
++  // d3d12_gpu_pass_profile: GPU time per guest render pass and per kind of
++  // work, from timestamp queries written where the kind of recorded work
++  // changes (see command_processor.cpp). Subsystems recording work of their
++  // own kind call GpuPassMark, or use a GpuPassScope to return to the previous
++  // kind afterwards. While the profile is off, both test one member.
++  enum class GpuPassWork : uint8_t {
++    kOther,        // Not marked: submission setup, gamma ramps and the like.
++    kDraw,         // Guest draws, attributed to their render pass.
++    kTransfer,     // Host render target ownership transfers before draws.
++    kResolveDump,  // Host render targets copied to the EDRAM buffer to resolve.
++    kResolveCopy,  // Resolve copies to guest memory (also direct resolves).
++    kResolveClear,
++    kTextureLoad,  // Texture loading and untiling.
++    kUpload,       // Guest memory uploaded to the shared memory buffer.
++    kMemexport,    // Memexport readback copies.
++    kSwap,         // Frame end: gamma, post effects and the output copy.
++    kCount
++  };
++  void GpuPassMark(GpuPassWork work) {
++    if (gpu_pass_block_ != UINT32_MAX) [[unlikely]] {
++      GpuPassMarkWork(work, UINT32_MAX);
++    }
++  }
++  class GpuPassScope {
++   public:
++    GpuPassScope(D3D12CommandProcessor& command_processor, GpuPassWork work)
++        : command_processor_(command_processor) {
++      if (command_processor.gpu_pass_block_ != UINT32_MAX) [[unlikely]] {
++        active_ = command_processor.GpuPassPush(work, saved_);
++      }
++    }
++    ~GpuPassScope() {
++      if (active_) [[unlikely]] {
++        command_processor_.GpuPassPop(saved_);
++      }
++    }
++    GpuPassScope(const GpuPassScope&) = delete;
++    GpuPassScope& operator=(const GpuPassScope&) = delete;
++
++   private:
++    D3D12CommandProcessor& command_processor_;
++    uint64_t saved_ = 0;
++    bool active_ = false;
++  };
++
+   // Returns true if the barrier has been inserted (the new state is different).
+   bool PushTransitionBarrier(ID3D12Resource* resource, D3D12_RESOURCE_STATES old_state,
+                              D3D12_RESOURCE_STATES new_state,
+@@ -925,6 +970,32 @@ class D3D12CommandProcessor : public CommandProcessor {
+   static_assert(sizeof(SystemConstantsInputs) == sizeof(uint32_t) * 82);
+   SystemConstantsInputs system_constants_inputs_;
+   bool system_constants_inputs_valid_ = false;
++
++  // d3d12_gpu_pass_profile (see GpuPassWork). The state is created when the
++  // profile is first enabled.
++  struct GpuPassProfile;
++  bool InitializeGpuPassProfile();
++  void ShutdownGpuPassProfile();
++  void BeginGpuPassSubmission();
++  void EndGpuPassSubmission();
++  // Starts a segment of the given work (pass: index of the submission's pass
++  // for kDraw) if it differs from the open one.
++  void GpuPassMarkWork(GpuPassWork work, uint32_t pass);
++  // Before recording a guest draw.
++  void GpuPassMarkDraw(reg::RB_DEPTHCONTROL normalized_depth_control,
++                       uint32_t normalized_color_mask);
++  // The next draw starts a new pass even with the same render targets.
++  void GpuPassEndPass();
++  // For GpuPassScope: saved receives the open segment, packed.
++  bool GpuPassPush(GpuPassWork work, uint64_t& saved);
++  void GpuPassPop(uint64_t saved);
++  void ProcessGpuPassResults();
++  void FinishGpuPassFrame();
++  void LogGpuPassWindow();
++  std::unique_ptr<GpuPassProfile> gpu_pass_profile_;
++  // Query block of the open submission while it's measured, or UINT32_MAX.
++  uint32_t gpu_pass_block_ = UINT32_MAX;
++  bool gpu_pass_profile_failed_ = false;
+ };
+ 
+ }  // namespace rex::graphics::d3d12
+diff --git a/include/rex/graphics/d3d12/deferred_command_list.h b/include/rex/graphics/d3d12/deferred_command_list.h
+index 9065d02..d9f5d7a 100644
+--- a/include/rex/graphics/d3d12/deferred_command_list.h
++++ b/include/rex/graphics/d3d12/deferred_command_list.h
+@@ -37,6 +37,9 @@ class DeferredCommandList {
+   // Exchanges the recorded commands with another stream, for handing a
+   // recorded submission over to another thread without copying.
+   void SwapCommandStream(std::vector<uintmax_t>& other) { command_stream_.swap(other); }
++  // Grows with every recorded command; d3d12_gpu_pass_profile uses it to tell
++  // whether anything was recorded between two of its marks.
++  size_t GetCommandStreamSize() const { return command_stream_.size(); }
+ 
+   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
+                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index fd240bf..6a4e32b 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <cmath>
+ #include <cstdarg>
+ #include <cstring>
+ #include <mutex>
+@@ -86,6 +87,13 @@ REXCVAR_DEFINE_BOOL(d3d12_gpu_timestamp_buckets, false, "GPU/D3D12",
+                     "submissions, EDRAM resolves, frame-end work) and log it every 120 frames")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(d3d12_gpu_pass_profile, false, "GPU/D3D12",
++                    "Measure GPU execution time per guest render pass and per kind of work "
++                    "(draws by render target size, resolves, render target transfers, texture "
++                    "loads, uploads, frame end) with timestamp queries where the kind of work "
++                    "changes, and log it every 120 frames with the most expensive passes")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ // Measurement probe for "how fast could this run if translating guest draws
+ // cost nothing". The screen stops updating while it is active.
+ REXCVAR_DEFINE_STRING(d3d12_debug_drop_draws, "off", "GPU/D3D12",
+@@ -225,6 +233,184 @@ struct D3D12CommandProcessor::GpuTimestampProfile {
+   FrameTotals frame_totals;
+ };
+ 
++// d3d12_gpu_pass_profile state. A timestamp is written wherever the kind of
++// recorded work changes (GpuPassMarkWork), splitting each submission into
++// consecutive segments: segment i runs from query i to query i + 1 of the
++// submission's block, so the segments add up to the submission's GPU time.
++// Draw segments belong to a render pass: consecutive draws writing the same
++// render targets, ended early by a resolve. Blocks are read once their
++// submission's fence has completed, summed per guest frame, and a window of
++// frames is logged together.
++struct D3D12CommandProcessor::GpuPassProfile {
++  static constexpr uint32_t kBlockQueries = 1024;
++  static constexpr uint32_t kBlockCount = 96;
++  static constexpr uint32_t kLogFrameInterval = 120;
++  static constexpr uint32_t kTopPasses = 10;
++  static constexpr uint32_t kMaxWindowPasses = 4096;
++  static constexpr size_t kWorkCount = size_t(GpuPassWork::kCount);
++
++  // What a pass draws to, from the guest registers of its draws: the color
++  // render targets that are written and the depth buffer if it's used.
++  struct PassKey {
++    static constexpr uint32_t kUsed = UINT32_C(1) << 31;
++    static constexpr uint32_t kDepthWritten = 1;
++    // RB_SURFACE_INFO pitch | MSAA << 16.
++    uint32_t surface = 0;
++    // kUsed | RB_COLOR_INFO base and format, or 0.
++    uint32_t color[xenos::kMaxColorRenderTargets] = {};
++    // kUsed | RB_DEPTH_INFO base and format, or 0.
++    uint32_t depth = 0;
++    uint32_t flags = 0;
++    bool operator==(const PassKey& other) const {
++      return std::memcmp(this, &other, sizeof(*this)) == 0;
++    }
++    uint64_t Hash() const {
++      const uint32_t* words = &surface;
++      uint64_t hash = UINT64_C(14695981039346656037);
++      for (size_t i = 0; i < sizeof(*this) / sizeof(uint32_t); ++i) {
++        hash = (hash ^ words[i]) * UINT64_C(1099511628211);
++      }
++      return hash;
++    }
++    uint32_t pitch() const { return surface & 0x3FFF; }
++    uint32_t msaa_samples() const { return uint32_t(1) << ((surface >> 16) & 3); }
++    bool has_color() const {
++      for (uint32_t info : color) {
++        if (info) {
++          return true;
++        }
++      }
++      return false;
++    }
++  };
++  static_assert(sizeof(PassKey) == sizeof(uint32_t) * 7);
++  enum PassClass : uint32_t { kFull, kHalf, kSmall, kDepthOnly, kClassCount };
++  static PassClass Classify(const PassKey& key, uint32_t reference_width) {
++    if (!key.has_color()) {
++      return kDepthOnly;
++    }
++    if (key.pitch() * 4 >= reference_width * 3) {
++      return kFull;
++    }
++    if (key.pitch() * 8 >= reference_width * 3) {
++      return kHalf;
++    }
++    return kSmall;
++  }
++
++  // A pass's draws within one submission.
++  struct BlockPass {
++    uint32_t ordinal;  // Pass number in the guest frame.
++    uint32_t draws;
++    // Furthest scissor corner of the draws, in guest pixels.
++    uint32_t right;
++    uint32_t bottom;
++    PassKey key;
++  };
++  struct Segment {
++    GpuPassWork work;
++    // Index in the block's passes for kDraw.
++    uint32_t pass;
++  };
++  struct Block {
++    uint64_t submission = 0;
++    uint64_t frame = 0;
++    uint32_t reference_width = 0;
++    uint32_t query_count = 0;
++    std::vector<Segment> segments;
++    std::vector<BlockPass> passes;
++  };
++
++  struct FramePass {
++    PassKey key;
++    uint64_t ticks = 0;
++    // Render target ownership transfers recorded before its draws.
++    uint64_t transfer_ticks = 0;
++    uint32_t draws = 0;
++    uint32_t right = 0;
++    uint32_t bottom = 0;
++    bool seen = false;
++  };
++  struct Frame {
++    uint64_t frame = UINT64_MAX;
++    uint32_t reference_width = 0;
++    uint32_t submissions = 0;
++    uint64_t queries = 0;
++    uint64_t first_start = 0;
++    uint64_t last_end = 0;
++    uint64_t work_ticks[kWorkCount] = {};
++    uint64_t work_segments[kWorkCount] = {};
++    // By pass ordinal.
++    std::vector<FramePass> passes;
++  };
++
++  // A pass identified across frames by its render targets and by how many
++  // passes with the same render targets came before it in the frame.
++  struct WindowPass {
++    PassKey key;
++    uint32_t occurrence;
++    PassClass pass_class;
++    uint64_t ticks;
++    uint64_t transfer_ticks;
++    uint64_t draws;
++    uint32_t frames;
++    uint32_t right;
++    uint32_t bottom;
++  };
++  static constexpr uint32_t kBinCount = 5;
++  struct Window {
++    uint32_t frames = 0;
++    uint64_t submissions = 0;
++    uint64_t queries = 0;
++    uint64_t span = 0;
++    uint64_t work_ticks[kWorkCount] = {};
++    uint64_t work_segments[kWorkCount] = {};
++    uint64_t class_ticks[kClassCount] = {};
++    uint64_t class_draws[kClassCount] = {};
++    uint64_t class_passes[kClassCount] = {};
++    // Passes by draw count: 1, 2-9, 10-99, 100-999, 1000+.
++    uint64_t bin_ticks[kBinCount] = {};
++    uint64_t bin_draws[kBinCount] = {};
++    uint64_t bin_passes[kBinCount] = {};
++    // Least squares of pass time (us) against pass draw count.
++    double fit_n = 0, fit_x = 0, fit_y = 0, fit_xx = 0, fit_xy = 0, fit_yy = 0;
++    uint64_t untracked_passes = 0;
++    std::vector<WindowPass> passes;
++    std::unordered_map<uint64_t, uint32_t> pass_indices;
++  };
++
++  Microsoft::WRL::ComPtr<ID3D12QueryHeap> query_heap;
++  Microsoft::WRL::ComPtr<ID3D12Resource> readback;
++  const uint64_t* readback_mapping = nullptr;
++  uint64_t frequency = 0;
++  Block blocks[kBlockCount];
++  std::vector<uint32_t> free_blocks;
++  // Submitted blocks in submission order.
++  std::deque<uint32_t> pending_blocks;
++
++  // Recording: the open segment.
++  GpuPassWork work = GpuPassWork::kOther;
++  uint32_t work_pass = UINT32_MAX;
++  size_t segment_stream_start = 0;
++  // Recording: the current pass of the guest frame pass_frame.
++  uint64_t pass_frame = UINT64_MAX;
++  bool pass_open = false;
++  PassKey pass_key;
++  uint32_t pass_ordinal = 0;
++  uint32_t next_ordinal = 0;
++  // Index of the current pass in the open block's passes, or UINT32_MAX.
++  uint32_t block_pass = UINT32_MAX;
++  // Guest frontbuffer width of the latest swap, for the pass size classes.
++  uint32_t reference_width = 0;
++  // Since the latest log.
++  uint64_t skipped_submissions = 0;
++  uint64_t unsplit_marks = 0;
++
++  Frame frame;
++  Window window;
++  std::unordered_map<uint64_t, uint32_t> frame_occurrences;
++};
++
+ D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
+                                              system::KernelState* kernel_state)
+     : CommandProcessor(graphics_system, kernel_state), deferred_command_list_(*this) {
+@@ -1864,6 +2050,7 @@ void D3D12CommandProcessor::ShutdownContext() {
+   InvalidateAllVertexBufferResidency();
+   ShutdownOcclusionQueryResources();
+   ShutdownGpuTimestampResources();
++  ShutdownGpuPassProfile();
+ 
+   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
+   readback_buffer_size_ = 0;
+@@ -2254,6 +2441,15 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   // Deliver occlusion query results that completed during the frame.
+   ProcessPendingOcclusionQueries(false);
+ 
++  // d3d12_gpu_pass_profile: the frame's last pass ends here, and the guest
++  // output width is what pass sizes are compared with.
++  if (gpu_pass_profile_) {
++    GpuPassEndPass();
++    if (frontbuffer_width) {
++      gpu_pass_profile_->reference_width = frontbuffer_width;
++    }
++  }
++
+   // Obtain the actual swap source texture size (resolution-scaled if it's a
+   // resolve destination, or not otherwise).
+   D3D12_SHADER_RESOURCE_VIEW_DESC swap_texture_srv_desc;
+@@ -2333,6 +2529,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
+        guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+         const uint32_t gpu_timestamp_bucket = BeginGpuTimestampBucket();
++        GpuPassMark(GpuPassWork::kSwap);
+         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+         ID3D12Device* device = provider.GetDevice();
+ 
+@@ -2974,6 +3171,11 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type,
+   SetPrimitiveTopology(primitive_topology);
+   // Must not call anything that may change the primitive topology from now on!
+ 
++  // d3d12_gpu_pass_profile: one member test per draw while it's off.
++  if (gpu_pass_block_ != UINT32_MAX) [[unlikely]] {
++    GpuPassMarkDraw(normalized_depth_control, normalized_color_mask);
++  }
++
+   // Draw.
+   if (primitive_processing_result.index_buffer_type ==
+       PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
+@@ -3076,6 +3278,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type,
+         memexport_total_size += memexport_range.size_bytes;
+       }
+       if (memexport_total_size != 0) {
++        GpuPassScope gpu_pass_memexport(*this, GpuPassWork::kMemexport);
+         if (REXCVAR_GET(readback_memexport_fast)) {
+           IssueDraw_MemexportReadbackFastPath(memexport_total_size);
+         } else {
+@@ -3392,6 +3595,12 @@ bool D3D12CommandProcessor::IssueCopy() {
+     return false;
+   }
+   const uint32_t gpu_timestamp_bucket = BeginGpuTimestampBucket();
++  // d3d12_gpu_pass_profile: a resolve ends the pass, and its parts are marked
++  // in the render target cache.
++  if (gpu_pass_block_ != UINT32_MAX) [[unlikely]] {
++    GpuPassEndPass();
++    GpuPassMarkWork(GpuPassWork::kResolveCopy, UINT32_MAX);
++  }
+   bool result;
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+   if (readback_mode == ReadbackResolveMode::kDisabled) {
+@@ -3673,6 +3882,9 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+   if (gpu_timestamp_profile_) {
+     ProcessGpuTimestampResults();
+   }
++  if (gpu_pass_profile_) {
++    ProcessGpuPassResults();
++  }
+ 
+   // Reclaim command allocators.
+   while (command_allocator_submitted_first_) {
+@@ -3849,6 +4061,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+     primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+ 
+     BeginGpuTimestampSubmission();
++    BeginGpuPassSubmission();
+ 
+     render_target_cache_->BeginSubmission();
+ 
+@@ -4021,7 +4234,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     // destroyed between frames.
+     SubmitBarriers();
+ 
+-    // Last command of the submission (d3d12_gpu_timestamp_buckets).
++    // Last commands of the submission (d3d12_gpu_pass_profile and
++    // d3d12_gpu_timestamp_buckets).
++    EndGpuPassSubmission();
+     EndGpuTimestampSubmission();
+ 
+     ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
+@@ -5929,6 +6144,487 @@ void D3D12CommandProcessor::FinishGpuTimestampFrame() {
+   gpu_profile::AddGpuValue(GpuValue::kSwapUs, to_us(totals.swap));
+ }
+ 
++bool D3D12CommandProcessor::InitializeGpuPassProfile() {
++  using Profile = GpuPassProfile;
++  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
++  ID3D12Device* device = provider.GetDevice();
++  constexpr uint32_t kQueryCount = Profile::kBlockQueries * Profile::kBlockCount;
++  UINT64 frequency = 0;
++  if (!device || FAILED(provider.GetDirectQueue()->GetTimestampFrequency(&frequency)) ||
++      !frequency) {
++    REXGPU_WARN("d3d12_gpu_pass_profile: GPU timestamps are not available on this queue");
++    return false;
++  }
++  auto profile = std::make_unique<Profile>();
++  D3D12_QUERY_HEAP_DESC heap_desc;
++  heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
++  heap_desc.Count = kQueryCount;
++  heap_desc.NodeMask = 0;
++  if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&profile->query_heap)))) {
++    REXGPU_WARN("d3d12_gpu_pass_profile: Failed to create the timestamp query heap");
++    return false;
++  }
++  D3D12_RESOURCE_DESC buffer_desc;
++  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, sizeof(uint64_t) * kQueryCount,
++                                          D3D12_RESOURCE_FLAG_NONE);
++  void* mapping = nullptr;
++  D3D12_RANGE read_range = {0, sizeof(uint64_t) * kQueryCount};
++  if (FAILED(device->CreateCommittedResource(
++          &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
++          &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++          IID_PPV_ARGS(&profile->readback))) ||
++      FAILED(profile->readback->Map(0, &read_range, &mapping))) {
++    REXGPU_WARN("d3d12_gpu_pass_profile: Failed to create the timestamp readback buffer");
++    return false;
++  }
++  profile->readback_mapping = reinterpret_cast<const uint64_t*>(mapping);
++  profile->frequency = frequency;
++  profile->free_blocks.reserve(Profile::kBlockCount);
++  for (uint32_t i = Profile::kBlockCount; i-- > 0;) {
++    profile->free_blocks.push_back(i);
++  }
++  gpu_pass_profile_ = std::move(profile);
++  REXGPU_INFO(
++      "d3d12_gpu_pass_profile: GPU pass timestamps enabled ({} Hz, at most {} per submission), "
++      "logging every {} frames",
++      frequency, Profile::kBlockQueries, Profile::kLogFrameInterval);
++  return true;
++}
++
++void D3D12CommandProcessor::ShutdownGpuPassProfile() {
++  gpu_pass_block_ = UINT32_MAX;
++  if (gpu_pass_profile_ && gpu_pass_profile_->readback_mapping) {
++    gpu_pass_profile_->readback->Unmap(0, nullptr);
++  }
++  gpu_pass_profile_.reset();
++}
++
++void D3D12CommandProcessor::BeginGpuPassSubmission() {
++  gpu_pass_block_ = UINT32_MAX;
++  GpuPassProfile* profile = gpu_pass_profile_.get();
++  if (!REXCVAR_GET(d3d12_gpu_pass_profile)) {
++    if (profile && profile->window.frames) {
++      // Switched off: the next time it's on, start with a fresh window.
++      profile->window = GpuPassProfile::Window();
++    }
++    return;
++  }
++  if (!profile) {
++    if (gpu_pass_profile_failed_) {
++      return;
++    }
++    if (!InitializeGpuPassProfile()) {
++      gpu_pass_profile_failed_ = true;
++      return;
++    }
++    profile = gpu_pass_profile_.get();
++  }
++  if (profile->free_blocks.empty()) {
++    ++profile->skipped_submissions;
++    return;
++  }
++  uint32_t block_index = profile->free_blocks.back();
++  profile->free_blocks.pop_back();
++  GpuPassProfile::Block& block = profile->blocks[block_index];
++  block.submission = 0;
++  block.frame = 0;
++  block.reference_width = 0;
++  block.segments.clear();
++  block.passes.clear();
++  deferred_command_list_.D3DEndQuery(profile->query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     block_index * GpuPassProfile::kBlockQueries);
++  block.query_count = 1;
++  block.segments.push_back({GpuPassWork::kOther, UINT32_MAX});
++  profile->work = GpuPassWork::kOther;
++  profile->work_pass = UINT32_MAX;
++  profile->block_pass = UINT32_MAX;
++  profile->segment_stream_start = deferred_command_list_.GetCommandStreamSize();
++  gpu_pass_block_ = block_index;
++}
++
++void D3D12CommandProcessor::EndGpuPassSubmission() {
++  if (gpu_pass_block_ == UINT32_MAX) {
++    return;
++  }
++  GpuPassProfile& profile = *gpu_pass_profile_;
++  uint32_t block_index = gpu_pass_block_;
++  gpu_pass_block_ = UINT32_MAX;
++  GpuPassProfile::Block& block = profile.blocks[block_index];
++  const uint32_t query_base = block_index * GpuPassProfile::kBlockQueries;
++  // GpuPassMarkWork always leaves a query for this.
++  deferred_command_list_.D3DEndQuery(profile.query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     query_base + block.query_count);
++  ++block.query_count;
++  deferred_command_list_.D3DResolveQueryData(profile.query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                             query_base, block.query_count, profile.readback.Get(),
++                                             sizeof(uint64_t) * query_base);
++  // The fence value this submission signals.
++  block.submission = submission_current_;
++  block.frame = frame_current_;
++  block.reference_width = profile.reference_width;
++  profile.pending_blocks.push_back(block_index);
++}
++
++void D3D12CommandProcessor::GpuPassMarkWork(GpuPassWork work, uint32_t pass) {
++  GpuPassProfile& profile = *gpu_pass_profile_;
++  if (profile.work == work && profile.work_pass == pass) {
++    return;
++  }
++  GpuPassProfile::Block& block = profile.blocks[gpu_pass_block_];
++  if (deferred_command_list_.GetCommandStreamSize() == profile.segment_stream_start) {
++    // Nothing recorded in the open segment yet: it becomes this one.
++    block.segments.back() = {work, pass};
++  } else {
++    // One query stays reserved for the end of the submission. Past that, the
++    // open segment keeps the work that follows.
++    if (block.query_count + 1 >= GpuPassProfile::kBlockQueries) {
++      ++profile.unsplit_marks;
++      return;
++    }
++    deferred_command_list_.D3DEndQuery(profile.query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                       gpu_pass_block_ * GpuPassProfile::kBlockQueries +
++                                           block.query_count);
++    ++block.query_count;
++    block.segments.push_back({work, pass});
++    profile.segment_stream_start = deferred_command_list_.GetCommandStreamSize();
++  }
++  profile.work = work;
++  profile.work_pass = pass;
++}
++
++void D3D12CommandProcessor::GpuPassMarkDraw(reg::RB_DEPTHCONTROL normalized_depth_control,
++                                            uint32_t normalized_color_mask) {
++  using Profile = GpuPassProfile;
++  Profile& profile = *gpu_pass_profile_;
++  const RegisterFile& regs = *register_file_;
++  Profile::PassKey key;
++  auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
++  key.surface = surface_info.surface_pitch | (uint32_t(surface_info.msaa_samples) << 16);
++  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
++    if ((normalized_color_mask >> (i * 4)) & 0xF) {
++      key.color[i] =
++          Profile::PassKey::kUsed | (regs[reg::RB_COLOR_INFO::rt_register_indices[i]] & 0x000F0FFF);
++    }
++  }
++  if (normalized_depth_control.z_enable || normalized_depth_control.stencil_enable) {
++    key.depth = Profile::PassKey::kUsed | (regs[XE_GPU_REG_RB_DEPTH_INFO] & 0x00010FFF);
++    if (normalized_depth_control.z_write_enable || normalized_depth_control.stencil_enable) {
++      key.flags |= Profile::PassKey::kDepthWritten;
++    }
++  }
++  if (profile.pass_frame != frame_current_) {
++    profile.pass_frame = frame_current_;
++    profile.next_ordinal = 0;
++    profile.pass_open = false;
++  }
++  if (!profile.pass_open || !(profile.pass_key == key)) {
++    profile.pass_open = true;
++    profile.pass_key = key;
++    profile.pass_ordinal = profile.next_ordinal++;
++  }
++  Profile::Block& block = profile.blocks[gpu_pass_block_];
++  if (profile.block_pass == UINT32_MAX ||
++      block.passes[profile.block_pass].ordinal != profile.pass_ordinal) {
++    // Ordinals only grow, so the current pass can only be the latest one.
++    profile.block_pass = uint32_t(block.passes.size());
++    block.passes.push_back({profile.pass_ordinal, 0, 0, 0, key});
++  }
++  Profile::BlockPass& block_pass = block.passes[profile.block_pass];
++  ++block_pass.draws;
++  draw_util::Scissor scissor;
++  draw_util::GetScissor(regs, scissor);
++  block_pass.right = std::max(block_pass.right, scissor.offset[0] + scissor.extent[0]);
++  block_pass.bottom = std::max(block_pass.bottom, scissor.offset[1] + scissor.extent[1]);
++  GpuPassMarkWork(GpuPassWork::kDraw, profile.block_pass);
++}
++
++void D3D12CommandProcessor::GpuPassEndPass() {
++  if (gpu_pass_profile_) {
++    gpu_pass_profile_->pass_open = false;
++  }
++}
++
++bool D3D12CommandProcessor::GpuPassPush(GpuPassWork work, uint64_t& saved) {
++  const GpuPassProfile& profile = *gpu_pass_profile_;
++  saved = (uint64_t(gpu_pass_block_) << 40) | (uint64_t(profile.work) << 32) | profile.work_pass;
++  GpuPassMarkWork(work, UINT32_MAX);
++  return true;
++}
++
++void D3D12CommandProcessor::GpuPassPop(uint64_t saved) {
++  // Not if the submission has ended in between.
++  if (gpu_pass_block_ != uint32_t(saved >> 40)) {
++    return;
++  }
++  GpuPassMarkWork(GpuPassWork(uint8_t(saved >> 32)), uint32_t(saved));
++}
++
++void D3D12CommandProcessor::ProcessGpuPassResults() {
++  using Profile = GpuPassProfile;
++  Profile* profile = gpu_pass_profile_.get();
++  if (!profile) {
++    return;
++  }
++  while (!profile->pending_blocks.empty()) {
++    uint32_t block_index = profile->pending_blocks.front();
++    const Profile::Block& block = profile->blocks[block_index];
++    if (block.submission > submission_completed_) {
++      break;
++    }
++    profile->pending_blocks.pop_front();
++    Profile::Frame& frame = profile->frame;
++    if (block.frame != frame.frame) {
++      FinishGpuPassFrame();
++      frame.frame = block.frame;
++      frame.submissions = 0;
++      frame.queries = 0;
++      frame.first_start = 0;
++      frame.last_end = 0;
++      std::fill(std::begin(frame.work_ticks), std::end(frame.work_ticks), uint64_t(0));
++      std::fill(std::begin(frame.work_segments), std::end(frame.work_segments), uint64_t(0));
++      frame.passes.clear();
++    }
++    frame.reference_width = block.reference_width;
++    const uint64_t* timestamps =
++        profile->readback_mapping + size_t(block_index) * Profile::kBlockQueries;
++    const uint32_t query_count = block.query_count;
++    if (query_count >= 2 && block.segments.size() + 1 == query_count &&
++        timestamps[query_count - 1] > timestamps[0]) {
++      if (!frame.submissions || timestamps[0] < frame.first_start) {
++        frame.first_start = timestamps[0];
++      }
++      frame.last_end = std::max(frame.last_end, timestamps[query_count - 1]);
++      ++frame.submissions;
++      frame.queries += query_count;
++      if (!block.passes.empty() && block.passes.back().ordinal >= frame.passes.size()) {
++        frame.passes.resize(size_t(block.passes.back().ordinal) + 1);
++      }
++      // Backwards, so transfers can be attributed to the pass of the next draw.
++      uint32_t next_draw_pass = UINT32_MAX;
++      for (size_t i = block.segments.size(); i-- > 0;) {
++        const uint64_t ticks =
++            timestamps[i + 1] > timestamps[i] ? timestamps[i + 1] - timestamps[i] : 0;
++        const Profile::Segment& segment = block.segments[i];
++        frame.work_ticks[size_t(segment.work)] += ticks;
++        ++frame.work_segments[size_t(segment.work)];
++        if (segment.work == GpuPassWork::kDraw && segment.pass < block.passes.size()) {
++          next_draw_pass = segment.pass;
++          frame.passes[block.passes[segment.pass].ordinal].ticks += ticks;
++        } else if (segment.work == GpuPassWork::kTransfer && next_draw_pass != UINT32_MAX) {
++          frame.passes[block.passes[next_draw_pass].ordinal].transfer_ticks += ticks;
++        }
++      }
++      for (const Profile::BlockPass& block_pass : block.passes) {
++        Profile::FramePass& frame_pass = frame.passes[block_pass.ordinal];
++        frame_pass.key = block_pass.key;
++        frame_pass.draws += block_pass.draws;
++        frame_pass.right = std::max(frame_pass.right, block_pass.right);
++        frame_pass.bottom = std::max(frame_pass.bottom, block_pass.bottom);
++        frame_pass.seen = true;
++      }
++    }
++    profile->free_blocks.push_back(block_index);
++  }
++}
++
++void D3D12CommandProcessor::FinishGpuPassFrame() {
++  using Profile = GpuPassProfile;
++  Profile* profile = gpu_pass_profile_.get();
++  if (!profile) {
++    return;
++  }
++  Profile::Frame& frame = profile->frame;
++  if (frame.frame == UINT64_MAX || !frame.submissions || !profile->frequency) {
++    return;
++  }
++  Profile::Window& window = profile->window;
++  const double us_per_tick = 1000000.0 / double(profile->frequency);
++  ++window.frames;
++  window.submissions += frame.submissions;
++  window.queries += frame.queries;
++  window.span += frame.last_end - frame.first_start;
++  for (size_t i = 0; i < Profile::kWorkCount; ++i) {
++    window.work_ticks[i] += frame.work_ticks[i];
++    window.work_segments[i] += frame.work_segments[i];
++  }
++  const uint32_t reference_width = frame.reference_width ? frame.reference_width : 1280;
++  profile->frame_occurrences.clear();
++  for (const Profile::FramePass& frame_pass : frame.passes) {
++    if (!frame_pass.seen) {
++      continue;
++    }
++    const Profile::PassClass pass_class = Profile::Classify(frame_pass.key, reference_width);
++    window.class_ticks[pass_class] += frame_pass.ticks;
++    window.class_draws[pass_class] += frame_pass.draws;
++    ++window.class_passes[pass_class];
++    const uint32_t draws = frame_pass.draws;
++    const uint32_t bin = draws <= 1 ? 0 : draws < 10 ? 1 : draws < 100 ? 2 : draws < 1000 ? 3 : 4;
++    window.bin_ticks[bin] += frame_pass.ticks;
++    window.bin_draws[bin] += draws;
++    ++window.bin_passes[bin];
++    const double x = double(draws);
++    const double y = double(frame_pass.ticks) * us_per_tick;
++    window.fit_n += 1.0;
++    window.fit_x += x;
++    window.fit_y += y;
++    window.fit_xx += x * x;
++    window.fit_xy += x * y;
++    window.fit_yy += y * y;
++
++    const uint64_t hash = frame_pass.key.Hash();
++    const uint32_t occurrence = profile->frame_occurrences[hash]++;
++    const uint64_t id = hash ^ (uint64_t(occurrence + 1) * UINT64_C(0x9E3779B97F4A7C15));
++    auto it = window.pass_indices.find(id);
++    if (it == window.pass_indices.end()) {
++      if (window.passes.size() >= Profile::kMaxWindowPasses) {
++        ++window.untracked_passes;
++        continue;
++      }
++      it = window.pass_indices.emplace(id, uint32_t(window.passes.size())).first;
++      window.passes.push_back({frame_pass.key, occurrence, pass_class, 0, 0, 0, 0, 0, 0});
++    }
++    Profile::WindowPass& window_pass = window.passes[it->second];
++    window_pass.ticks += frame_pass.ticks;
++    window_pass.transfer_ticks += frame_pass.transfer_ticks;
++    window_pass.draws += frame_pass.draws;
++    ++window_pass.frames;
++    window_pass.right = std::max(window_pass.right, frame_pass.right);
++    window_pass.bottom = std::max(window_pass.bottom, frame_pass.bottom);
++  }
++  frame.submissions = 0;
++  if (window.frames >= Profile::kLogFrameInterval) {
++    LogGpuPassWindow();
++    window = Profile::Window();
++    profile->skipped_submissions = 0;
++    profile->unsplit_marks = 0;
++  }
++}
++
++void D3D12CommandProcessor::LogGpuPassWindow() {
++  using Profile = GpuPassProfile;
++  const Profile& profile = *gpu_pass_profile_;
++  const Profile::Window& window = profile.window;
++  if (!window.frames || !profile.frequency) {
++    return;
++  }
++  const double frames = double(window.frames);
++  const double us_per_tick = 1000000.0 / double(profile.frequency);
++  auto us = [&](uint64_t ticks) { return double(ticks) * us_per_tick / frames; };
++  auto work_us = [&](GpuPassWork work) { return us(window.work_ticks[size_t(work)]); };
++  uint64_t busy_ticks = 0;
++  for (uint64_t ticks : window.work_ticks) {
++    busy_ticks += ticks;
++  }
++  const double busy_us = us(busy_ticks);
++  auto class_text = [&](uint32_t pass_class) {
++    return fmt::format("{:.0f} ({:.1f} passes, {:.0f} draws)", us(window.class_ticks[pass_class]),
++                       double(window.class_passes[pass_class]) / frames,
++                       double(window.class_draws[pass_class]) / frames);
++  };
++  // Time, and the number of timed segments of that work.
++  auto work_text = [&](GpuPassWork work) {
++    return fmt::format("{:.0f} ({:.1f}x)", work_us(work),
++                       double(window.work_segments[size_t(work)]) / frames);
++  };
++  REXGPU_INFO(
++      "GPU pass profile (avg per frame over {} frames, us): busy={:.0f} span={:.0f} | "
++      "draws={:.0f} [full={} half={} small={} depth_only={}] | resolve={:.0f} [dump={} "
++      "copy={} clear={}] transfer={} texture_load={} upload={} memexport={} swap={} other={} | "
++      "submissions={:.1f}x timestamps={:.0f}x skipped_submissions={} unsplit_marks={}",
++      window.frames, busy_us, us(window.span), work_us(GpuPassWork::kDraw),
++      class_text(Profile::kFull), class_text(Profile::kHalf), class_text(Profile::kSmall),
++      class_text(Profile::kDepthOnly),
++      work_us(GpuPassWork::kResolveDump) + work_us(GpuPassWork::kResolveCopy) +
++          work_us(GpuPassWork::kResolveClear),
++      work_text(GpuPassWork::kResolveDump), work_text(GpuPassWork::kResolveCopy),
++      work_text(GpuPassWork::kResolveClear), work_text(GpuPassWork::kTransfer),
++      work_text(GpuPassWork::kTextureLoad), work_text(GpuPassWork::kUpload),
++      work_text(GpuPassWork::kMemexport), work_text(GpuPassWork::kSwap),
++      work_text(GpuPassWork::kOther), double(window.submissions) / frames,
++      double(window.queries) / frames, profile.skipped_submissions, profile.unsplit_marks);
++
++  static const char* const kBinNames[Profile::kBinCount] = {"1", "2-9", "10-99", "100-999",
++                                                            "1000+"};
++  std::string bins;
++  for (uint32_t i = 0; i < Profile::kBinCount; ++i) {
++    const double bin_us = us(window.bin_ticks[i]);
++    const double bin_draws = double(window.bin_draws[i]) / frames;
++    bins += fmt::format("{}{} draws: {:.1f} passes {:.0f} draws {:.0f} us ({:.2f} us/draw)",
++                        i ? ", " : "", kBinNames[i], double(window.bin_passes[i]) / frames,
++                        bin_draws, bin_us, bin_draws > 0.0 ? bin_us / bin_draws : 0.0);
++  }
++  std::string fit = "n/a";
++  const double fit_denominator = window.fit_n * window.fit_xx - window.fit_x * window.fit_x;
++  if (window.fit_n >= 2.0 && fit_denominator > 0.0) {
++    const double slope =
++        (window.fit_n * window.fit_xy - window.fit_x * window.fit_y) / fit_denominator;
++    const double intercept = (window.fit_y - slope * window.fit_x) / window.fit_n;
++    const double y_variance = window.fit_n * window.fit_yy - window.fit_y * window.fit_y;
++    const double r = y_variance > 0.0 ? (window.fit_n * window.fit_xy - window.fit_x * window.fit_y) /
++                                            std::sqrt(fit_denominator * y_variance)
++                                      : 0.0;
++    fit = fmt::format("{:.1f} us per pass + {:.2f} us per draw (r2={:.2f})", intercept, slope,
++                      r * r);
++  }
++  REXGPU_INFO("GPU pass profile draw cost (avg per frame): passes with {} | fit over passes: {}",
++              bins, fit);
++
++  std::vector<const Profile::WindowPass*> top;
++  top.reserve(window.passes.size());
++  for (const Profile::WindowPass& window_pass : window.passes) {
++    top.push_back(&window_pass);
++  }
++  const size_t top_count = std::min(top.size(), size_t(Profile::kTopPasses));
++  // Ranked by the time of the draws plus the transfers they needed.
++  std::partial_sort(top.begin(), top.begin() + top_count, top.end(),
++                    [](const Profile::WindowPass* a, const Profile::WindowPass* b) {
++                      return a->ticks + a->transfer_ticks > b->ticks + b->transfer_ticks;
++                    });
++  static const char* const kClassNames[Profile::kClassCount] = {"full", "half", "small",
++                                                                "depth_only"};
++  for (size_t i = 0; i < top_count; ++i) {
++    const Profile::WindowPass& pass = *top[i];
++    const double pass_us = us(pass.ticks);
++    const double pass_draws = double(pass.draws) / frames;
++    std::string targets;
++    for (uint32_t rt = 0; rt < xenos::kMaxColorRenderTargets; ++rt) {
++      const uint32_t info = pass.key.color[rt];
++      if (!info) {
++        continue;
++      }
++      targets += fmt::format(
++          "{}rt{} {}@{}", targets.empty() ? "" : " ", rt,
++          xenos::GetColorRenderTargetFormatName(xenos::ColorRenderTargetFormat((info >> 16) & 0xF)),
++          info & 0xFFF);
++    }
++    if (pass.key.depth) {
++      targets += fmt::format(
++          "{}depth {}@{}{}", targets.empty() ? "" : " ",
++          xenos::GetDepthRenderTargetFormatName(
++              xenos::DepthRenderTargetFormat((pass.key.depth >> 16) & 1)),
++          pass.key.depth & 0xFFF,
++          (pass.key.flags & Profile::PassKey::kDepthWritten) ? "" : " (read only)");
++    }
++    if (targets.empty()) {
++      targets = "none";
++    }
++    const double transfer_us = us(pass.transfer_ticks);
++    REXGPU_INFO(
++        "GPU pass profile top {}: {:.0f} us ({:.1f}% of busy) = draws {:.0f} + transfers before "
++        "them {:.0f}, {:.1f} draws ({:.2f} us/draw), {}, pitch {} {}xMSAA, drawn to {}x{}, {}, "
++        "pass {} with these targets, in {:.0f}% of frames",
++        i + 1, pass_us + transfer_us,
++        busy_us > 0.0 ? 100.0 * (pass_us + transfer_us) / busy_us : 0.0, pass_us, transfer_us,
++        pass_draws, pass_draws > 0.0 ? pass_us / pass_draws : 0.0, kClassNames[pass.pass_class],
++        pass.key.pitch(), pass.key.msaa_samples(), pass.right, pass.bottom, targets,
++        pass.occurrence + 1, 100.0 * double(pass.frames) / frames);
++  }
++  if (window.untracked_passes) {
++    REXGPU_INFO("GPU pass profile: {} pass instances not tracked individually (limit {})",
++                window.untracked_passes, Profile::kMaxWindowPasses);
++  }
++}
++
+ bool D3D12CommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out) {
+   // Don't let the cursor wrap onto indices whose results are still pending.
+   if (pending_occlusion_queries_.size() >= kMaxOcclusionQueries / 2) {
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index c2297db..50d839d 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -1081,6 +1081,8 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
+         }
+       }
+       if (any_transfers) {
++        D3D12CommandProcessor::GpuPassScope gpu_pass_transfer(
++            command_processor_, D3D12CommandProcessor::GpuPassWork::kTransfer);
+         PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+                                          depth_and_color_render_targets, transfers);
+       }
+@@ -1222,6 +1224,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+           }
+         }
+         if (!direct_resolved) {
++          command_processor_.GpuPassMark(D3D12CommandProcessor::GpuPassWork::kResolveDump);
+           // Dump the current contents of the render targets owning the affected
+           // range to edram_buffer_.
+           uint32_t dump_base;
+@@ -1303,6 +1306,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+           TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+ 
+           // Submit the resolve.
++          command_processor_.GpuPassMark(D3D12CommandProcessor::GpuPassWork::kResolveCopy);
+           command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
+           command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
+           command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
+@@ -1347,6 +1351,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+   bool clear_depth = resolve_info.IsClearingDepth();
+   bool clear_color = resolve_info.IsClearingColor();
+   if (clear_depth || clear_color) {
++    command_processor_.GpuPassMark(D3D12CommandProcessor::GpuPassWork::kResolveClear);
+     switch (GetPath()) {
+       case Path::kHostRenderTargets: {
+         Transfer::Rectangle clear_rectangle;
+diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
+index 9711a5d..2e99139 100644
+--- a/src/graphics/d3d12/shared_memory.cpp
++++ b/src/graphics/d3d12/shared_memory.cpp
+@@ -374,6 +374,8 @@ bool D3D12SharedMemory::UploadRanges(
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
++  D3D12CommandProcessor::GpuPassScope gpu_pass_upload(command_processor_,
++                                                      D3D12CommandProcessor::GpuPassWork::kUpload);
+   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
+   command_processor_.SubmitBarriers();
+   auto& command_list = command_processor_.GetDeferredCommandList();
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index 9cffe88..37ad866 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -1729,6 +1729,8 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
+   TextureKey texture_key = d3d12_texture.key();
+ 
++  D3D12CommandProcessor::GpuPassScope gpu_pass_texture_load(
++      command_processor_, D3D12CommandProcessor::GpuPassWork::kTextureLoad);
+   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+ 

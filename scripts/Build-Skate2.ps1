@@ -42,7 +42,16 @@ $sdkPatchNames = @(
     'rexglue-0.10.0-command-processor-overhead.patch',
     'rexglue-0.10.0-d3d12-submission-and-queries.patch',
     'rexglue-0.10.0-placed-textures.patch',
-    'rexglue-0.10.0-gpu-trace-recorder.patch')
+    'rexglue-0.10.0-gpu-trace-recorder.patch',
+    'rexglue-0.10.0-timer-queue-blocking-wait.patch',
+    'rexglue-0.10.0-gpu-frame-profile.patch',
+    'rexglue-0.10.0-debug-drop-draws.patch',
+    'rexglue-0.10.0-draw-state-caches.patch',
+    'rexglue-0.10.0-buffer-and-render-target-fast-paths.patch',
+    'rexglue-0.10.0-gpu-pass-profile.patch',
+    'rexglue-0.10.0-render-target-transfer-skip.patch',
+    'rexglue-0.10.0-tiled-scene-single-pass.patch',
+    'rexglue-0.10.0-present-idleclean-lag.patch')
 $projectRoot = Join-Path $workspace 'skate2'
 $gameRoot = Join-Path $workspace 'game'
 $manifest = Join-Path $projectRoot 'skate2_manifest.toml'

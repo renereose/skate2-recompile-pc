@@ -4,6 +4,7 @@
 
 #include "crash_diagnostics.h"
 #include "automatic_gpu_selection.h"
+#include "draw_probe.h"
 #include "frame_pacing.h"
 #include "frame_rate.h"
 #include "nvidia_profile.h"
@@ -45,7 +46,8 @@ class Skate2App : public rex::ReXApp {
                             "d3d12_present_idleclean_sync", "skate2_frame_rate",
                             "skate2_frame_limit", "skate2_nvidia_max_performance",
                             "resolution_scale", "draw_resolution_scale_x",
-                            "draw_resolution_scale_y"}) {
+                            "draw_resolution_scale_y", "gpu_tiled_scene_single_pass",
+                            "gpu_render_target_transfer_skip_overwritten"}) {
       REXLOG_INFO("Graphics setting {}={}", flag, rex::cvar::GetFlagByName(flag));
     }
     // The SDK exposes per-frame CSV counters but does not open the configured
@@ -66,6 +68,7 @@ class Skate2App : public rex::ReXApp {
     // Values in effect for this run are final now; the panel compares against
     // them for its restart notices.
     if (settings_panel_) settings_panel_->Start();
+    if (draw_probe_) draw_probe_->Start();
   }
 
   void OnConfigureFonts(ImFontAtlas* atlas) override {
@@ -79,6 +82,12 @@ class Skate2App : public rex::ReXApp {
     rex::ui::RegisterBind("bind_skate2_settings", "F1", "Toggle Skate 2 settings panel", [this] {
       if (settings_panel_) settings_panel_->Toggle();
     });
+    draw_probe_ = std::make_unique<Skate2DrawProbe>(drawer);
+    // F9 is the runtime's GPU trace capture.
+    rex::ui::RegisterBind("bind_skate2_draw_probe", "F10",
+                          "Cycle the Skate 2 draw-translation probe (diagnostic)", [this] {
+                            if (draw_probe_) draw_probe_->Cycle();
+                          });
   }
 
   void OnPostSetup() override {
@@ -100,7 +109,9 @@ class Skate2App : public rex::ReXApp {
 
   void OnShutdown() override {
     rex::ui::UnregisterBind("bind_skate2_settings");
+    rex::ui::UnregisterBind("bind_skate2_draw_probe");
     settings_panel_.reset();
+    draw_probe_.reset();
   }
 
   bool SetupPresentation() override {
@@ -112,6 +123,7 @@ class Skate2App : public rex::ReXApp {
     // The GPU plugin has now registered its flags, but guest GPU setup has not
     // run yet, so these defaults still take effect in this run.
     ApplyProfileDefaults();
+    PrepareSkate2DrawProbe();
     if (!ValidateSkate2FrameRate()) return false;
     if (!ConfigureSkate2FrameLimit(window() ? window()->GetNativeWindowHandle() : nullptr)) {
       return false;
@@ -170,8 +182,9 @@ class Skate2App : public rex::ReXApp {
   }
  private:
   // The default launch profile: 2x rendering on the ROV path with the graphics
-  // synchronization settings (the unlimited frame-rate mode is the registered
-  // default of skate2_frame_rate). The launchers pass none of these unless a
+  // synchronization settings, and no frame-end refresh of GPU-written page
+  // state (the unlimited frame-rate mode is the registered default of
+  // skate2_frame_rate). The launchers pass none of these unless a
   // profile or option asks for another value, so a value saved in skate2.toml
   // applies; these apply when nothing is saved, also for a direct skate2.exe
   // launch.
@@ -192,6 +205,20 @@ class Skate2App : public rex::ReXApp {
         {"render_target_path_d3d12", "rov"},
         {"async_shader_compilation", "false"},
         {"d3d12_present_idleclean_sync", "true"},
+        // With the refresh on, every frame end marks guest memory as changed,
+        // so about 15 MB is uploaded again each frame in Free Skate and the
+        // GPU repeats work on unchanged data. Off: 88 to 100 FPS at a busy
+        // Free Skate spot (2x, RTV), GPU busy 10.2 to 3.7 ms per frame, with
+        // no visual difference seen. --clear_memory_page_state=true restores
+        // the refresh.
+        {"clear_memory_page_state", "false"},
+        // Gameplay draws its main scene in two EDRAM strips (1152x544 and
+        // 1152x96 at 2x MSAA); this draws the first strip at full height and
+        // skips the replay. Same Free Skate spot: 5,290 to 2,870 draws and
+        // 176 to 224 FPS on PC, 35 to 46 FPS on the Steam Deck, with no
+        // visual difference seen. Scenes that do not fit fall back to strips.
+        // --gpu_tiled_scene_single_pass=false restores strip-by-strip drawing.
+        {"gpu_tiled_scene_single_pass", "true"},
     };
     // The registry has no call to change a default, so its entries are
     // updated directly, as the runtime's settings overlay also reads them.
@@ -217,4 +244,5 @@ class Skate2App : public rex::ReXApp {
   bool performance_capture_started_ = false;
   std::filesystem::path skate2_config_path_;
   std::unique_ptr<Skate2SettingsPanel> settings_panel_;
+  std::unique_ptr<Skate2DrawProbe> draw_probe_;
 };

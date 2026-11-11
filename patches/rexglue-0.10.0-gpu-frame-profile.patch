@@ -1,0 +1,1149 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 2ec85a2..7f5cae2 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -221,6 +221,11 @@ class D3D12CommandProcessor : public CommandProcessor {
+ 
+   bool IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
+                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
++  // kProfile: with gpu_cpu_profile stage timing; the false instantiation has
++  // no profiling code.
++  template <bool kProfile>
++  bool IssueDrawImpl(xenos::PrimitiveType primitive_type, uint32_t index_count,
++                     IndexBufferInfo* index_buffer_info, bool major_mode_explicit);
+   bool IssueCopy() override;
+ 
+   void InitializeTrace() override;
+@@ -716,6 +721,24 @@ class D3D12CommandProcessor : public CommandProcessor {
+     uint64_t submission;
+   };
+   std::deque<PendingOcclusionQuery> pending_occlusion_queries_;
++
++  // d3d12_gpu_timestamp_buckets: timestamp queries at the start and end of
++  // every submission and around EDRAM resolves and the frame-end work. The
++  // state (GpuTimestampProfile, defined in command_processor.cpp) is created
++  // when first enabled; results are accumulated per guest frame into
++  // gpu_profile.h.
++  enum class GpuTimestampBucket : uint8_t { kResolve, kSwap };
++  struct GpuTimestampProfile;
++  bool InitializeGpuTimestampResources();
++  void ShutdownGpuTimestampResources();
++  void BeginGpuTimestampSubmission();
++  void EndGpuTimestampSubmission();
++  // Returns a token for EndGpuTimestampBucket, or UINT32_MAX if not timed.
++  uint32_t BeginGpuTimestampBucket();
++  void EndGpuTimestampBucket(uint32_t token, GpuTimestampBucket kind);
++  void ProcessGpuTimestampResults();
++  void FinishGpuTimestampFrame();
++
+   struct VertexBufferState {
+     uint32_t address = UINT32_MAX;
+     uint32_t size = UINT32_MAX;
+@@ -817,6 +840,10 @@ class D3D12CommandProcessor : public CommandProcessor {
+ 
+   // Temporary storage for memexport stream constants used in the draw.
+   std::vector<draw_util::MemExportRange> memexport_ranges_;
++
++  // Last, so that the other members keep their offsets.
++  std::unique_ptr<GpuTimestampProfile> gpu_timestamp_profile_;
++  bool gpu_timestamp_profile_failed_ = false;
+ };
+ 
+ }  // namespace rex::graphics::d3d12
+diff --git a/include/rex/graphics/gpu_profile.h b/include/rex/graphics/gpu_profile.h
+new file mode 100644
+index 0000000..9571277
+--- /dev/null
++++ b/include/rex/graphics/gpu_profile.h
+@@ -0,0 +1,198 @@
++/**
++ * @file        graphics/gpu_profile.h
++ * @brief       Runtime-armed frame attribution for the GPU emulation
++ *
++ * Based on the CPU profile (gpu_cpu_profile) and the D3D12 GPU timestamp
++ * buckets (d3d12_gpu_timestamp_buckets) of the rexglue-skate3 fork of the
++ * ReXGlue SDK (commits 9dd4138 and 4ae4da7), Copyright (c) 2026, Tom Clay,
++ * reduced to a self-contained set of stages for this runtime. Distributed
++ * under the BSD 3-Clause License included with the ReXGlue license notice.
++ */
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++
++#if defined(_M_X64) || defined(__x86_64__)
++#if defined(_MSC_VER) || defined(_WIN32)
++#include <intrin.h>
++#else
++#include <x86intrin.h>
++#endif
++#define REX_GPU_PROFILE_RDTSC 1
++#endif
++
++namespace rex::graphics::gpu_profile {
++
++// Accumulated per stage while gpu_cpu_profile is enabled. Times are raw ticks
++// (see Ticks()), counts are numbers of scopes, except for value stages.
++// Each stage is written by a single thread: the GPU command thread, or for
++// kAsync* the D3D12 submission thread. Stages only nest as documented in the
++// command processor's profile log.
++enum class Stage : uint32_t {
++  // Command thread, top level.
++  kCommandBusy,  // Executing primary ring buffer commands.
++  kCommandIdle,  // Waiting for the guest to write more commands.
++  kGuestWait,    // WAIT_REG_MEM waits for guest memory or registers.
++  // Draws (IssueDraw, excluding EDRAM copies). The sub-stages are laps.
++  kDraw,
++  kDrawBegin,         // BeginSubmission, including waits for queued frames.
++  kDrawPrimitive,     // Primitive (index buffer) processing.
++  kDrawRenderTarget,  // Render target cache update (may record transfers).
++  kDrawPipeline,      // Shader translation lookup and pipeline configuration.
++  kDrawTexture,       // Texture cache requests (may load textures).
++  kDrawState,         // Viewport, constants, descriptors and root bindings.
++  kDrawVertexBuffer,  // Vertex and memexport buffers in shared memory.
++  kDrawRecord,        // Topology, index buffer, barriers and the draw itself.
++  kDrawMemexport,     // Memexport invalidation and readback.
++  kDrawSubmit,        // Mid-frame submission (d3d12_submit_draw_interval).
++  kCopy,              // EDRAM resolves (IssueCopy).
++  kSwap,              // Frame end (IssueSwap), including the frame submission.
++  // Submission on the command thread (all EndSubmission calls).
++  kSubmit,
++  kSubmitRecord,      // Synchronous: replay and ExecuteCommandLists.
++                      // Asynchronous: handing the commands to the thread.
++  kSubmitThreadWait,  // Waiting for the submission thread at frame end.
++  kFenceWait,         // Waiting for the GPU to complete submissions.
++  kPresentSync,       // Present idle-clean synchronization wait.
++  // D3D12 submission thread (d3d12_async_submission).
++  kAsyncReplay,   // Replaying recorded commands into the command list.
++  kAsyncExecute,  // ExecuteCommandLists and Signal.
++  // Values (ticks hold the value).
++  kUploadBytes,  // Guest memory uploaded to the GPU shared memory buffer.
++  kCount
++};
++
++struct Slot {
++  std::atomic<uint64_t> ticks{0};
++  std::atomic<uint64_t> count{0};
++};
++
++inline std::atomic<bool> g_enabled{false};
++inline Slot g_slots[size_t(Stage::kCount)];
++
++// GPU timestamp results (d3d12_gpu_timestamp_buckets), in microseconds,
++// accumulated per completed guest frame by the backend.
++enum class GpuValue : uint32_t {
++  kFrames,       // Guest frames with timestamp results.
++  kSubmissions,  // Command lists measured.
++  kBusyUs,       // Sum of command list execution times.
++  kSpanUs,       // First command list start to last command list end.
++  kResolveUs,    // EDRAM resolves.
++  kResolves,
++  kSwapUs,  // Frame end work (gamma and post effects before presenting).
++  kSkippedSubmissions,  // Not measured because no query block was free.
++  kCount
++};
++inline std::atomic<bool> g_gpu_enabled{false};
++inline std::atomic<uint64_t> g_gpu_values[size_t(GpuValue::kCount)];
++
++inline void AddGpuValue(GpuValue value, uint64_t amount) {
++  g_gpu_values[size_t(value)].fetch_add(amount, std::memory_order_relaxed);
++}
++
++inline bool Enabled() { return g_enabled.load(std::memory_order_relaxed); }
++
++inline uint64_t Ticks() {
++#ifdef REX_GPU_PROFILE_RDTSC
++  return __rdtsc();
++#else
++  return uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
++#endif
++}
++
++// Single-writer accumulation without a locked read-modify-write.
++inline void Add(Stage stage, uint64_t ticks, uint64_t count = 1) {
++  Slot& slot = g_slots[size_t(stage)];
++  slot.ticks.store(slot.ticks.load(std::memory_order_relaxed) + ticks, std::memory_order_relaxed);
++  slot.count.store(slot.count.load(std::memory_order_relaxed) + count, std::memory_order_relaxed);
++}
++
++inline void AddValue(Stage stage, uint64_t value) {
++  if (Enabled()) {
++    Add(stage, value);
++  }
++}
++
++// Times a whole scope. Costs one relaxed load and a branch when disabled.
++class Scope {
++ public:
++  explicit Scope(Stage stage) : stage_(stage), active_(Enabled()) {
++    if (active_) {
++      start_ = Ticks();
++    }
++  }
++  ~Scope() {
++    if (active_) {
++      Add(stage_, Ticks() - start_);
++    }
++  }
++  Scope(const Scope&) = delete;
++  Scope& operator=(const Scope&) = delete;
++
++ private:
++  Stage stage_;
++  bool active_;
++  uint64_t start_ = 0;
++};
++
++// Splits a scope into consecutive stages with one timestamp per boundary:
++// Mark(stage) attributes the time since the previous mark to stage.
++class Laps {
++ public:
++  Laps() : active_(Enabled()) {
++    if (active_) {
++      last_ = Ticks();
++    }
++  }
++  void Mark(Stage stage) {
++    if (active_) {
++      uint64_t now = Ticks();
++      Add(stage, now - last_);
++      last_ = now;
++    }
++  }
++  bool active() const { return active_; }
++
++ private:
++  bool active_;
++  uint64_t last_ = 0;
++};
++
++// Compile-time variant of Scope plus Laps for per-draw code, which is
++// instantiated twice and selected by one Enabled() check: the scope's whole
++// time goes to `total`, the laps to their stages. Without kActive it does
++// nothing, so the unprofiled path has no profiling code at all.
++template <bool kActive>
++class ScopeLaps {
++ public:
++  explicit ScopeLaps(Stage total) : total_(total) {
++    if constexpr (kActive) {
++      start_ = Ticks();
++      last_ = start_;
++    }
++  }
++  ~ScopeLaps() {
++    if constexpr (kActive) {
++      Add(total_, Ticks() - start_);
++    }
++  }
++  ScopeLaps(const ScopeLaps&) = delete;
++  ScopeLaps& operator=(const ScopeLaps&) = delete;
++  void Mark(Stage stage) {
++    if constexpr (kActive) {
++      uint64_t now = Ticks();
++      Add(stage, now - last_);
++      last_ = now;
++    }
++  }
++
++ private:
++  Stage total_;
++  uint64_t start_ = 0;
++  uint64_t last_ = 0;
++};
++
++}  // namespace rex::graphics::gpu_profile
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 3ae98a7..a06c62b 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -28,6 +29,7 @@
+ #include <rex/chrono/clock.h>
+ #include <rex/graphics/command_processor.h>
+ #include <rex/graphics/flags.h>
++#include <rex/graphics/gpu_profile.h>
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/graphics/pipeline/texture/info.h>
+ #include <rex/graphics/sampler_info.h>
+@@ -85,6 +87,11 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+                     "pipelines are being prepared.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(gpu_cpu_profile, false, "GPU",
++                    "Log where the GPU command thread spends each frame (waiting for the game, "
++                    "draw stages, resolves, submission, waits for the GPU) every 120 guest frames")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU/Trace",
+                       "Folder for GPU trace (.xtr) files. Empty: logs/gpu_traces next to the "
+                       "executable.")
+@@ -148,6 +155,181 @@ std::string GetTraceTimestamp() {
+   return timestamp;
+ }
+ 
++// Reporting window of gpu_cpu_profile and d3d12_gpu_timestamp_buckets. Only
++// used on the command thread. The stage accumulators are never reset (some are
++// written by other threads); each window logs the difference to a snapshot.
++constexpr uint32_t kGpuProfileLogFrameInterval = 120;
++struct GpuProfileWindow {
++  bool active = false;
++  uint32_t frames = 0;
++  uint64_t start_ticks = 0;
++  std::chrono::steady_clock::time_point start_time;
++  uint64_t ticks[size_t(gpu_profile::Stage::kCount)] = {};
++  uint64_t counts[size_t(gpu_profile::Stage::kCount)] = {};
++  uint64_t gpu_values[size_t(gpu_profile::GpuValue::kCount)] = {};
++};
++GpuProfileWindow g_gpu_profile_window;
++
++void StartGpuProfileWindow(GpuProfileWindow& window, uint64_t now_ticks,
++                           std::chrono::steady_clock::time_point now_time) {
++  for (size_t i = 0; i < size_t(gpu_profile::Stage::kCount); ++i) {
++    window.ticks[i] = gpu_profile::g_slots[i].ticks.load(std::memory_order_relaxed);
++    window.counts[i] = gpu_profile::g_slots[i].count.load(std::memory_order_relaxed);
++  }
++  for (size_t i = 0; i < size_t(gpu_profile::GpuValue::kCount); ++i) {
++    window.gpu_values[i] = gpu_profile::g_gpu_values[i].load(std::memory_order_relaxed);
++  }
++  window.frames = 0;
++  window.start_ticks = now_ticks;
++  window.start_time = now_time;
++  window.active = true;
++}
++
++void LogGpuProfileWindow(const GpuProfileWindow& window, uint64_t now_ticks,
++                         std::chrono::steady_clock::time_point now_time, bool cpu_profile) {
++  using gpu_profile::GpuValue;
++  using gpu_profile::Stage;
++  const double frames = double(window.frames);
++  const double window_us = double(
++      std::chrono::duration_cast<std::chrono::microseconds>(now_time - window.start_time).count());
++  const uint64_t window_ticks = now_ticks - window.start_ticks;
++  if (window_us <= 0.0 || !window_ticks || frames <= 0.0) {
++    return;
++  }
++  // Scope timestamps are raw ticks; calibrate them against the wall clock of
++  // the whole window.
++  const double us_per_tick = window_us / double(window_ticks);
++  const double frame_us = window_us / frames;
++  auto ticks = [&](Stage stage) {
++    return gpu_profile::g_slots[size_t(stage)].ticks.load(std::memory_order_relaxed) -
++           window.ticks[size_t(stage)];
++  };
++  auto us = [&](Stage stage) -> uint64_t {
++    return uint64_t(double(ticks(stage)) * us_per_tick / frames + 0.5);
++  };
++  auto per_frame = [&](Stage stage) -> double {
++    return double(gpu_profile::g_slots[size_t(stage)].count.load(std::memory_order_relaxed) -
++                  window.counts[size_t(stage)]) /
++           frames;
++  };
++  auto gpu_value = [&](GpuValue value) {
++    return gpu_profile::g_gpu_values[size_t(value)].load(std::memory_order_relaxed) -
++           window.gpu_values[size_t(value)];
++  };
++
++  const uint64_t gpu_frames = gpu_value(GpuValue::kFrames);
++  const double gpu_busy_us =
++      gpu_frames ? double(gpu_value(GpuValue::kBusyUs)) / double(gpu_frames) : 0.0;
++
++  if (cpu_profile) {
++    const uint64_t busy = us(Stage::kCommandBusy);
++    const uint64_t idle = us(Stage::kCommandIdle);
++    const uint64_t guest_wait = us(Stage::kGuestWait);
++    const uint64_t fence_wait = us(Stage::kFenceWait);
++    const uint64_t present_sync = us(Stage::kPresentSync);
++    const uint64_t thread_wait = us(Stage::kSubmitThreadWait);
++    const uint64_t waits = guest_wait + fence_wait + present_sync + thread_wait;
++    const uint64_t work = busy > waits ? busy - waits : 0;
++    const uint64_t async_busy = us(Stage::kAsyncReplay) + us(Stage::kAsyncExecute);
++    const uint64_t submit_record = us(Stage::kSubmitRecord);
++
++    // A first hint at the limiting side; the stage values are the evidence.
++    const char* limit = "mixed";
++    if (gpu_frames && gpu_busy_us >= 0.85 * frame_us) {
++      limit = "gpu";
++    } else if (double(async_busy) >= 0.85 * frame_us || double(thread_wait) >= 0.2 * frame_us) {
++      limit = "submission_thread";
++    } else if (double(fence_wait + present_sync) >= 0.2 * frame_us) {
++      limit = "gpu_wait";
++    } else if (double(work) >= 0.75 * frame_us) {
++      limit = double(submit_record) >= 0.3 * double(work) ? "command_thread_submission"
++                                                          : "command_thread";
++    } else if (double(idle + guest_wait) >= 0.25 * frame_us) {
++      limit = "guest";
++    }
++    REXGPU_INFO(
++        "GPU profile (avg per frame over {} frames, us): frame={:.0f} fps={:.1f} limit={} | "
++        "command thread: busy={} work={} idle={} guest_wait={} fence_wait={} ({:.1f}x) "
++        "present_sync={} submit_thread_wait={}",
++        window.frames, frame_us, 1000000.0 / frame_us, limit, busy, work, idle, guest_wait,
++        fence_wait, per_frame(Stage::kFenceWait), present_sync, thread_wait);
++
++    const uint64_t draw = us(Stage::kDraw);
++    const Stage draw_stages[] = {Stage::kDrawBegin,        Stage::kDrawPrimitive,
++                                 Stage::kDrawRenderTarget, Stage::kDrawPipeline,
++                                 Stage::kDrawTexture,      Stage::kDrawState,
++                                 Stage::kDrawVertexBuffer, Stage::kDrawRecord,
++                                 Stage::kDrawMemexport,    Stage::kDrawSubmit};
++    uint64_t draw_staged_ticks = 0;
++    for (Stage stage : draw_stages) {
++      draw_staged_ticks += ticks(stage);
++    }
++    const uint64_t draw_ticks = ticks(Stage::kDraw);
++    const uint64_t draw_other =
++        draw_ticks > draw_staged_ticks
++            ? uint64_t(double(draw_ticks - draw_staged_ticks) * us_per_tick / frames + 0.5)
++            : 0;
++    REXGPU_INFO(
++        "GPU profile stages (avg per frame, us): draws={:.0f}x draw={} [begin={} prim={} rt={} "
++        "pipeline={} tex={} state={} vb={} record={} memexport={} submit={} other={}] "
++        "copies={:.1f}x copy={} swap={} | submissions={:.1f}x submit={} [record={}] | "
++        "upload={:.0f}KiB | submission thread: replay={} execute={}",
++        per_frame(Stage::kDraw), draw, us(Stage::kDrawBegin), us(Stage::kDrawPrimitive),
++        us(Stage::kDrawRenderTarget), us(Stage::kDrawPipeline), us(Stage::kDrawTexture),
++        us(Stage::kDrawState), us(Stage::kDrawVertexBuffer), us(Stage::kDrawRecord),
++        us(Stage::kDrawMemexport), us(Stage::kDrawSubmit), draw_other, per_frame(Stage::kCopy),
++        us(Stage::kCopy), us(Stage::kSwap), per_frame(Stage::kSubmit), us(Stage::kSubmit),
++        submit_record, double(ticks(Stage::kUploadBytes)) / frames / 1024.0,
++        us(Stage::kAsyncReplay), us(Stage::kAsyncExecute));
++  }
++
++  if (gpu_frames) {
++    const double gpu_frames_d = double(gpu_frames);
++    auto gpu_avg = [&](GpuValue value) { return double(gpu_value(value)) / gpu_frames_d; };
++    const double span_us = gpu_avg(GpuValue::kSpanUs);
++    const double resolve_us = gpu_avg(GpuValue::kResolveUs);
++    const double swap_us = gpu_avg(GpuValue::kSwapUs);
++    const double rest_us = std::max(0.0, gpu_busy_us - resolve_us - swap_us);
++    REXGPU_INFO(
++        "GPU profile timestamps (avg per frame over {} frames, us): busy={:.0f} span={:.0f} "
++        "idle_in_span={:.0f} draws_and_other={:.0f} resolve={:.0f} ({:.1f}x) swap={:.0f} "
++        "submissions={:.1f}x utilization={:.0f}% of frame={:.0f} skipped_submissions={}",
++        gpu_frames, gpu_busy_us, span_us, std::max(0.0, span_us - gpu_busy_us), rest_us,
++        resolve_us, gpu_avg(GpuValue::kResolves), swap_us, gpu_avg(GpuValue::kSubmissions),
++        100.0 * gpu_busy_us / frame_us, frame_us, gpu_value(GpuValue::kSkippedSubmissions));
++  }
++}
++
++// Called on the command thread after each guest frame's swap.
++void OnGpuProfileFrameEnd() {
++  const bool cpu_profile = REXCVAR_GET(gpu_cpu_profile);
++  GpuProfileWindow& window = g_gpu_profile_window;
++  if (cpu_profile != gpu_profile::g_enabled.load(std::memory_order_relaxed)) {
++    gpu_profile::g_enabled.store(cpu_profile, std::memory_order_relaxed);
++    if (cpu_profile) {
++      REXGPU_INFO("GPU profile: CPU attribution enabled (gpu_cpu_profile), logging every {} frames",
++                  kGpuProfileLogFrameInterval);
++    }
++    // Restart so a window only covers frames with complete data.
++    window.active = false;
++  }
++  if (!cpu_profile && !gpu_profile::g_gpu_enabled.load(std::memory_order_relaxed)) {
++    window.active = false;
++    return;
++  }
++  const uint64_t now_ticks = gpu_profile::Ticks();
++  const auto now_time = std::chrono::steady_clock::now();
++  if (!window.active) {
++    StartGpuProfileWindow(window, now_ticks, now_time);
++    return;
++  }
++  if (++window.frames < kGpuProfileLogFrameInterval) {
++    return;
++  }
++  LogGpuProfileWindow(window, now_ticks, now_time, cpu_profile);
++  StartGpuProfileWindow(window, now_ticks, now_time);
++}
++
+ }  // namespace
+ 
+ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
+@@ -269,6 +451,7 @@ void CommandProcessor::WorkerThreadMain() {
+     uint32_t write_ptr_index = write_ptr_index_.load();
+     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
++      gpu_profile::Scope profile_idle(gpu_profile::Stage::kCommandIdle);
+       // We've run out of commands to execute.
+       // We spin here waiting for new ones, as the overhead of waiting on our
+       // event is too high.
+@@ -295,7 +478,10 @@ void CommandProcessor::WorkerThreadMain() {
+     assert_true(read_ptr_index_ != write_ptr_index);
+ 
+     // Execute. Note that we handle wraparound transparently.
+-    read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
++    {
++      gpu_profile::Scope profile_busy(gpu_profile::Stage::kCommandBusy);
++      read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
++    }
+ 
+     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
+     //     that many indices.
+@@ -1184,7 +1370,11 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
+   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+ 
+-  IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
++  {
++    gpu_profile::Scope profile_swap(gpu_profile::Stage::kSwap);
++    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
++  }
++  OnGpuProfileFrameEnd();
+ 
+   ++counter_;
+ 
+@@ -1270,6 +1460,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         break;
+     }
+     if (!matched) {
++      gpu_profile::Scope profile_guest_wait(gpu_profile::Stage::kGuestWait);
+       // Wait.
+       if (wait >= 0x100) {
+         PrepareForWait();
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 3b4743d..66946ad 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -24,6 +24,7 @@
+ #include <rex/graphics/d3d12/graphics_system.h>
+ #include <rex/graphics/d3d12/shader.h>
+ #include <rex/graphics/flags.h>
++#include <rex/graphics/gpu_profile.h>
+ #include <rex/graphics/registers.h>
+ #include <rex/graphics/util/draw.h>
+ #include <rex/graphics/xenos.h>
+@@ -70,6 +71,11 @@ REXCVAR_DEFINE_BOOL(d3d12_present_idleclean_sync, false, "GPU/D3D12",
+                     "between closed guest frames. Other WAIT_UNTIL cases are unchanged.")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(d3d12_gpu_timestamp_buckets, false, "GPU/D3D12",
++                    "Measure GPU execution time per frame with timestamp queries (whole "
++                    "submissions, EDRAM resolves, frame-end work) and log it every 120 frames")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -83,6 +89,46 @@ namespace shaders {
+ #include "../shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h"
+ }  // namespace shaders
+ 
++// d3d12_gpu_timestamp_buckets state. Each submission uses one block of the
++// query heap: queries 0 and 1 are its start and end, then pairs around
++// buckets. Blocks are read once their submission's fence has completed.
++struct D3D12CommandProcessor::GpuTimestampProfile {
++  static constexpr uint32_t kBlockSize = 64;
++  static constexpr uint32_t kBlockCount = 128;
++  struct Block {
++    uint64_t submission = 0;
++    uint64_t frame = 0;
++    uint32_t query_count = 0;
++    uint32_t open_bucket_query = UINT32_MAX;
++    uint32_t bucket_count = 0;
++    struct Bucket {
++      GpuTimestampBucket kind;
++      uint32_t start_query;
++    } buckets[kBlockSize / 2];
++  };
++  struct FrameTotals {
++    uint64_t frame = UINT64_MAX;
++    uint64_t first_start = 0;
++    uint64_t last_end = 0;
++    uint64_t busy = 0;
++    uint64_t resolve = 0;
++    uint64_t resolves = 0;
++    uint64_t swap = 0;
++    uint64_t submissions = 0;
++  };
++  Microsoft::WRL::ComPtr<ID3D12QueryHeap> query_heap;
++  Microsoft::WRL::ComPtr<ID3D12Resource> readback;
++  const uint64_t* readback_mapping = nullptr;
++  uint64_t frequency = 0;
++  Block blocks[kBlockCount];
++  std::vector<uint32_t> free_blocks;
++  // Submitted blocks in submission order.
++  std::deque<uint32_t> pending_blocks;
++  // Block of the open submission, or UINT32_MAX.
++  uint32_t current_block = UINT32_MAX;
++  FrameTotals frame_totals;
++};
++
+ D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
+                                              system::KernelState* kernel_state)
+     : CommandProcessor(graphics_system, kernel_state), deferred_command_list_(*this) {
+@@ -1671,6 +1717,7 @@ void D3D12CommandProcessor::ShutdownContext() {
+   StopSubmissionThread();
+   InvalidateAllVertexBufferResidency();
+   ShutdownOcclusionQueryResources();
++  ShutdownGpuTimestampResources();
+ 
+   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
+   readback_buffer_size_ = 0;
+@@ -1900,6 +1947,7 @@ void D3D12CommandProcessor::MaybeSynchronizePresentIdleclean(uint32_t index, uin
+       event_result = submission_fence_->SetEventOnCompletion(target, fence_completion_event_);
+       if (SUCCEEDED(event_result)) {
+         ++stats.wait_calls;
++        gpu_profile::Scope profile_present_sync(gpu_profile::Stage::kPresentSync);
+         wait_result = WaitForSingleObject(fence_completion_event_, 5000);
+       }
+     }
+@@ -2136,6 +2184,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+       guest_output_width, guest_output_height, display_width, display_height,
+       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
+        guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
++        const uint32_t gpu_timestamp_bucket = BeginGpuTimestampBucket();
+         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+         ID3D12Device* device = provider.GetDevice();
+ 
+@@ -2394,6 +2443,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+         // presenter so it can submit its own commands for displaying it to the
+         // queue.
+         SubmitBarriers();
++        EndGpuTimestampBucket(gpu_timestamp_bucket, GpuTimestampBucket::kSwap);
+         EndSubmission(true);
+         return true;
+       });
+@@ -2415,9 +2465,11 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
+   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
+ }
+ 
+-bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
+-                                      IndexBufferInfo* index_buffer_info,
+-                                      bool major_mode_explicit) {
++template <bool kProfile>
++bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type,
++                                          uint32_t index_count,
++                                          IndexBufferInfo* index_buffer_info,
++                                          bool major_mode_explicit) {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -2431,6 +2483,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     return IssueCopy();
+   }
+ 
++  // gpu_cpu_profile: whole draw, and consecutive laps for its stages. No code
++  // when kProfile is false.
++  gpu_profile::ScopeLaps<kProfile> profile_laps(gpu_profile::Stage::kDraw);
++
+   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
+ 
+   // Vertex shader analysis.
+@@ -2473,14 +2529,18 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   }
+   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
+   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
++  profile_laps.Mark(gpu_profile::Stage::kDrawPipeline);
+ 
+   if (!BeginSubmission(true)) {
+     return false;
+   }
++  profile_laps.Mark(gpu_profile::Stage::kDrawBegin);
+ 
+   // Process primitives.
+   PrimitiveProcessor::ProcessingResult primitive_processing_result;
+-  if (!primitive_processor_->Process(primitive_processing_result)) {
++  bool primitive_processed = primitive_processor_->Process(primitive_processing_result);
++  profile_laps.Mark(gpu_profile::Stage::kDrawPrimitive);
++  if (!primitive_processed) {
+     return false;
+   }
+   if (!primitive_processing_result.host_draw_vertex_count) {
+@@ -2507,12 +2567,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+                 *pixel_shader, interpolator_mask, ps_param_gen_pos, normalized_depth_control)
+           : DxbcShaderTranslator::Modification(0);
+ 
++  profile_laps.Mark(gpu_profile::Stage::kDrawPipeline);
++
+   // Set up the render targets - this may perform dispatches and draws.
+   uint32_t normalized_color_mask =
+       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                    : 0;
+-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+-                                    normalized_color_mask, *vertex_shader)) {
++  bool render_targets_updated = render_target_cache_->Update(
++      is_rasterization_done, normalized_depth_control, normalized_color_mask, *vertex_shader);
++  profile_laps.Mark(gpu_profile::Stage::kDrawRenderTarget);
++  if (!render_targets_updated) {
+     return false;
+   }
+ 
+@@ -2539,10 +2603,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   }
+   void* pipeline_handle;
+   ID3D12RootSignature* root_signature;
+-  if (!pipeline_cache_->ConfigurePipeline(
+-          vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
+-          normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
+-          bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
++  bool pipeline_configured = pipeline_cache_->ConfigurePipeline(
++      vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
++      normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
++      bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature);
++  profile_laps.Mark(gpu_profile::Stage::kDrawPipeline);
++  if (!pipeline_configured) {
+     return false;
+   }
+   if (REXCVAR_GET(async_shader_compilation) &&
+@@ -2555,6 +2621,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+       vertex_shader->GetUsedTextureMaskAfterTranslation() |
+       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+   texture_cache_->RequestTextures(used_texture_mask);
++  profile_laps.Mark(gpu_profile::Stage::kDrawTexture);
+ 
+   // Bind the pipeline after configuring it and doing everything that may bind
+   // other pipelines.
+@@ -2617,7 +2684,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+                              used_texture_mask, normalized_depth_control, normalized_color_mask);
+ 
+   // Update constant buffers, descriptors and root parameters.
+-  if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
++  bool bindings_updated = UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used);
++  profile_laps.Mark(gpu_profile::Stage::kDrawState);
++  if (!bindings_updated) {
+     return false;
+   }
+   // Must not call anything that can change the descriptor heap from now on!
+@@ -2691,6 +2760,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+       return false;
+     }
+   }
++  profile_laps.Mark(gpu_profile::Stage::kDrawVertexBuffer);
+ 
+   // Primitive topology.
+   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
+@@ -2832,6 +2902,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+     }
+   }
++  profile_laps.Mark(gpu_profile::Stage::kDrawRecord);
+ 
+   if (memexport_used) {
+     // Make sure this memexporting draw is ordered with other work using shared
+@@ -2864,6 +2935,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+         }
+       }
+     }
++    profile_laps.Mark(gpu_profile::Stage::kDrawMemexport);
+   }
+ 
+   // Optionally hand the work recorded so far to the GPU in the middle of a
+@@ -2876,11 +2948,23 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+       !scratch_buffer_used_ && !active_occlusion_query_.valid &&
+       CanEndSubmissionImmediately()) {
+     EndSubmission(false);
++    profile_laps.Mark(gpu_profile::Stage::kDrawSubmit);
+   }
+ 
+   return true;
+ }
+ 
++bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
++                                      IndexBufferInfo* index_buffer_info,
++                                      bool major_mode_explicit) {
++  // One flag check per draw while gpu_cpu_profile is off.
++  if (gpu_profile::Enabled()) [[unlikely]] {
++    return IssueDrawImpl<true>(primitive_type, index_count, index_buffer_info,
++                               major_mode_explicit);
++  }
++  return IssueDrawImpl<false>(primitive_type, index_count, index_buffer_info, major_mode_explicit);
++}
++
+ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
+   if (!total_size || memexport_ranges_.empty()) {
+     return true;
+@@ -3047,16 +3131,22 @@ bool D3D12CommandProcessor::IssueCopy() {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
++  gpu_profile::Scope profile_copy(gpu_profile::Stage::kCopy);
+   if (!BeginSubmission(true)) {
+     return false;
+   }
++  const uint32_t gpu_timestamp_bucket = BeginGpuTimestampBucket();
++  bool result;
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+   if (readback_mode == ReadbackResolveMode::kDisabled) {
+     uint32_t written_address, written_length;
+-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+-                                         written_address, written_length);
++    result = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
++                                           written_address, written_length);
++  } else {
++    result = IssueCopy_ReadbackResolvePath();
+   }
+-  return IssueCopy_ReadbackResolvePath();
++  EndGpuTimestampBucket(gpu_timestamp_bucket, GpuTimestampBucket::kResolve);
++  return result;
+ }
+ 
+ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -3291,6 +3381,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+                     SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
+                         fence_value, fence_completion_event_)))) {
+         PROFILE_CMD_BUFFER_STALL();
++        gpu_profile::Scope profile_fence_wait(gpu_profile::Stage::kFenceWait);
+         WaitForSingleObject(fence_completion_event_, INFINITE);
+         queue_operations_done_since_submission_signal_ = false;
+       } else {
+@@ -3310,6 +3401,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+     if (SUCCEEDED(
+             submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
+       PROFILE_CMD_BUFFER_STALL();
++      gpu_profile::Scope profile_fence_wait(gpu_profile::Stage::kFenceWait);
+       WaitForSingleObject(fence_completion_event_, INFINITE);
+       submission_completed_ = submission_fence_->GetCompletedValue();
+     }
+@@ -3322,6 +3414,10 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+     return;
+   }
+ 
++  if (gpu_timestamp_profile_) {
++    ProcessGpuTimestampResults();
++  }
++
+   // Reclaim command allocators.
+   while (command_allocator_submitted_first_) {
+     if (command_allocator_submitted_first_->last_usage_submission > submission_completed_) {
+@@ -3496,6 +3592,8 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+     }
+     primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+ 
++    BeginGpuTimestampSubmission();
++
+     render_target_cache_->BeginSubmission();
+ 
+     primitive_processor_->BeginSubmission();
+@@ -3596,14 +3694,20 @@ void D3D12CommandProcessor::SubmissionThreadMain() {
+       submission_jobs_.pop_front();
+       submission_thread_busy_ = true;
+     }
+-    job.command_allocator->Reset();
+-    command_list_->Reset(job.command_allocator, nullptr);
+-    submission_thread_command_list_->SwapCommandStream(job.command_stream);
+-    submission_thread_command_list_->Execute(command_list_, command_list_1_);
+-    command_list_->Close();
+-    ID3D12CommandList* execute_command_lists[] = {command_list_};
+-    direct_queue->ExecuteCommandLists(1, execute_command_lists);
+-    direct_queue->Signal(submission_fence_, job.fence_value);
++    {
++      gpu_profile::Scope profile_replay(gpu_profile::Stage::kAsyncReplay);
++      job.command_allocator->Reset();
++      command_list_->Reset(job.command_allocator, nullptr);
++      submission_thread_command_list_->SwapCommandStream(job.command_stream);
++      submission_thread_command_list_->Execute(command_list_, command_list_1_);
++      command_list_->Close();
++    }
++    {
++      gpu_profile::Scope profile_execute(gpu_profile::Stage::kAsyncExecute);
++      ID3D12CommandList* execute_command_lists[] = {command_list_};
++      direct_queue->ExecuteCommandLists(1, execute_command_lists);
++      direct_queue->Signal(submission_fence_, job.fence_value);
++    }
+     submission_thread_command_list_->SwapCommandStream(job.command_stream);
+     job.command_stream.clear();
+     {
+@@ -3647,6 +3751,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+ 
+   if (submission_open_) {
+     assert_false(scratch_buffer_used_);
++    gpu_profile::Scope profile_submit(gpu_profile::Stage::kSubmit);
+ 
+     if (active_occlusion_query_.valid && occlusion_query_heap_) {
+       deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
+@@ -3660,6 +3765,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     // destroyed between frames.
+     SubmitBarriers();
+ 
++    // Last command of the submission (d3d12_gpu_timestamp_buckets).
++    EndGpuTimestampSubmission();
++
+     ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
+ 
+     // Submit the deferred command list.
+@@ -3669,6 +3777,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     // happens between Xenia submissions.
+     ID3D12CommandAllocator* command_allocator =
+         command_allocator_writable_first_->command_allocator;
++    gpu_profile::Laps profile_record_laps;
+     if (async_submission_enabled_) {
+       // Hand the recorded commands over to the submission thread, which will
+       // replay them, execute them and signal the submission fence in order.
+@@ -3697,6 +3806,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+       ID3D12CommandList* execute_command_lists[] = {command_list_};
+       direct_queue->ExecuteCommandLists(1, execute_command_lists);
+     }
++    profile_record_laps.Mark(gpu_profile::Stage::kSubmitRecord);
+     command_allocator_writable_first_->last_usage_submission = submission_current_;
+     if (command_allocator_submitted_last_) {
+       command_allocator_submitted_last_->next = command_allocator_writable_first_;
+@@ -3716,6 +3826,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+       if (is_swap) {
+         // The presenter relies on the guest output having been submitted to
+         // the queue before it's notified about the new frame.
++        gpu_profile::Scope profile_thread_wait(gpu_profile::Stage::kSubmitThreadWait);
+         AwaitSubmissionThreadIdle();
+       }
+     } else {
+@@ -5144,6 +5255,232 @@ void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
+   occlusion_query_heap_.Reset();
+ }
+ 
++bool D3D12CommandProcessor::InitializeGpuTimestampResources() {
++  using Profile = GpuTimestampProfile;
++  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
++  ID3D12Device* device = provider.GetDevice();
++  constexpr uint32_t kQueryCount = Profile::kBlockSize * Profile::kBlockCount;
++  UINT64 frequency = 0;
++  if (!device || FAILED(provider.GetDirectQueue()->GetTimestampFrequency(&frequency)) ||
++      !frequency) {
++    REXGPU_WARN("d3d12_gpu_timestamp_buckets: GPU timestamps are not available on this queue");
++    return false;
++  }
++  auto profile = std::make_unique<Profile>();
++  D3D12_QUERY_HEAP_DESC heap_desc;
++  heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
++  heap_desc.Count = kQueryCount;
++  heap_desc.NodeMask = 0;
++  if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&profile->query_heap)))) {
++    REXGPU_WARN("d3d12_gpu_timestamp_buckets: Failed to create the timestamp query heap");
++    return false;
++  }
++  D3D12_RESOURCE_DESC buffer_desc;
++  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, sizeof(uint64_t) * kQueryCount,
++                                          D3D12_RESOURCE_FLAG_NONE);
++  void* mapping = nullptr;
++  D3D12_RANGE read_range = {0, sizeof(uint64_t) * kQueryCount};
++  if (FAILED(device->CreateCommittedResource(
++          &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
++          &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++          IID_PPV_ARGS(&profile->readback))) ||
++      FAILED(profile->readback->Map(0, &read_range, &mapping))) {
++    REXGPU_WARN("d3d12_gpu_timestamp_buckets: Failed to create the timestamp readback buffer");
++    return false;
++  }
++  profile->readback_mapping = reinterpret_cast<const uint64_t*>(mapping);
++  profile->frequency = frequency;
++  profile->free_blocks.reserve(Profile::kBlockCount);
++  for (uint32_t i = Profile::kBlockCount; i-- > 0;) {
++    profile->free_blocks.push_back(i);
++  }
++  gpu_timestamp_profile_ = std::move(profile);
++  REXGPU_INFO("d3d12_gpu_timestamp_buckets: GPU timestamps enabled ({} Hz)", frequency);
++  return true;
++}
++
++void D3D12CommandProcessor::ShutdownGpuTimestampResources() {
++  gpu_profile::g_gpu_enabled.store(false, std::memory_order_relaxed);
++  if (gpu_timestamp_profile_ && gpu_timestamp_profile_->readback_mapping) {
++    gpu_timestamp_profile_->readback->Unmap(0, nullptr);
++  }
++  gpu_timestamp_profile_.reset();
++}
++
++void D3D12CommandProcessor::BeginGpuTimestampSubmission() {
++  GpuTimestampProfile* profile = gpu_timestamp_profile_.get();
++  if (profile) {
++    profile->current_block = UINT32_MAX;
++  }
++  if (!REXCVAR_GET(d3d12_gpu_timestamp_buckets)) {
++    if (gpu_profile::g_gpu_enabled.load(std::memory_order_relaxed)) {
++      gpu_profile::g_gpu_enabled.store(false, std::memory_order_relaxed);
++    }
++    return;
++  }
++  if (!profile) {
++    if (gpu_timestamp_profile_failed_) {
++      return;
++    }
++    if (!InitializeGpuTimestampResources()) {
++      gpu_timestamp_profile_failed_ = true;
++      return;
++    }
++    profile = gpu_timestamp_profile_.get();
++  }
++  gpu_profile::g_gpu_enabled.store(true, std::memory_order_relaxed);
++  if (profile->free_blocks.empty()) {
++    gpu_profile::AddGpuValue(gpu_profile::GpuValue::kSkippedSubmissions, 1);
++    return;
++  }
++  uint32_t block_index = profile->free_blocks.back();
++  profile->free_blocks.pop_back();
++  GpuTimestampProfile::Block& block = profile->blocks[block_index];
++  block.submission = 0;
++  block.frame = 0;
++  block.query_count = 2;
++  block.open_bucket_query = UINT32_MAX;
++  block.bucket_count = 0;
++  deferred_command_list_.D3DEndQuery(profile->query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     block_index * GpuTimestampProfile::kBlockSize);
++  profile->current_block = block_index;
++}
++
++void D3D12CommandProcessor::EndGpuTimestampSubmission() {
++  GpuTimestampProfile* profile = gpu_timestamp_profile_.get();
++  if (!profile || profile->current_block == UINT32_MAX) {
++    return;
++  }
++  uint32_t block_index = profile->current_block;
++  profile->current_block = UINT32_MAX;
++  GpuTimestampProfile::Block& block = profile->blocks[block_index];
++  ID3D12QueryHeap* query_heap = profile->query_heap.Get();
++  const uint32_t query_base = block_index * GpuTimestampProfile::kBlockSize;
++  if (block.open_bucket_query != UINT32_MAX) {
++    // A bucket still open at the end of the submission is dropped, but its
++    // end query is written so that every resolved query has been issued.
++    deferred_command_list_.D3DEndQuery(query_heap, D3D12_QUERY_TYPE_TIMESTAMP,
++                                       query_base + block.open_bucket_query + 1);
++    block.open_bucket_query = UINT32_MAX;
++  }
++  deferred_command_list_.D3DEndQuery(query_heap, D3D12_QUERY_TYPE_TIMESTAMP, query_base + 1);
++  deferred_command_list_.D3DResolveQueryData(query_heap, D3D12_QUERY_TYPE_TIMESTAMP, query_base,
++                                             block.query_count, profile->readback.Get(),
++                                             sizeof(uint64_t) * query_base);
++  // The fence value this submission signals.
++  block.submission = submission_current_;
++  block.frame = frame_current_;
++  profile->pending_blocks.push_back(block_index);
++}
++
++uint32_t D3D12CommandProcessor::BeginGpuTimestampBucket() {
++  GpuTimestampProfile* profile = gpu_timestamp_profile_.get();
++  if (!profile || profile->current_block == UINT32_MAX) {
++    return UINT32_MAX;
++  }
++  uint32_t block_index = profile->current_block;
++  GpuTimestampProfile::Block& block = profile->blocks[block_index];
++  if (block.open_bucket_query != UINT32_MAX ||
++      block.query_count + 2 > GpuTimestampProfile::kBlockSize) {
++    return UINT32_MAX;
++  }
++  uint32_t query = block.query_count;
++  block.query_count += 2;
++  block.open_bucket_query = query;
++  deferred_command_list_.D3DEndQuery(profile->query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     block_index * GpuTimestampProfile::kBlockSize + query);
++  return (block_index << 16) | query;
++}
++
++void D3D12CommandProcessor::EndGpuTimestampBucket(uint32_t token, GpuTimestampBucket kind) {
++  GpuTimestampProfile* profile = gpu_timestamp_profile_.get();
++  if (token == UINT32_MAX || !profile) {
++    return;
++  }
++  uint32_t block_index = token >> 16;
++  uint32_t query = token & 0xFFFF;
++  // Dropped if its submission has ended in the meantime.
++  if (block_index != profile->current_block) {
++    return;
++  }
++  GpuTimestampProfile::Block& block = profile->blocks[block_index];
++  if (block.open_bucket_query != query) {
++    return;
++  }
++  deferred_command_list_.D3DEndQuery(profile->query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     block_index * GpuTimestampProfile::kBlockSize + query + 1);
++  block.open_bucket_query = UINT32_MAX;
++  block.buckets[block.bucket_count++] = {kind, query};
++}
++
++void D3D12CommandProcessor::ProcessGpuTimestampResults() {
++  GpuTimestampProfile* profile = gpu_timestamp_profile_.get();
++  if (!profile) {
++    return;
++  }
++  while (!profile->pending_blocks.empty()) {
++    uint32_t block_index = profile->pending_blocks.front();
++    const GpuTimestampProfile::Block& block = profile->blocks[block_index];
++    if (block.submission > submission_completed_) {
++      break;
++    }
++    profile->pending_blocks.pop_front();
++    GpuTimestampProfile::FrameTotals& totals = profile->frame_totals;
++    if (block.frame != totals.frame) {
++      FinishGpuTimestampFrame();
++      totals = {};
++      totals.frame = block.frame;
++    }
++    const uint64_t* timestamps =
++        profile->readback_mapping + size_t(block_index) * GpuTimestampProfile::kBlockSize;
++    uint64_t start = timestamps[0];
++    uint64_t end = timestamps[1];
++    if (end > start) {
++      if (!totals.submissions || start < totals.first_start) {
++        totals.first_start = start;
++      }
++      totals.last_end = std::max(totals.last_end, end);
++      totals.busy += end - start;
++      ++totals.submissions;
++      for (uint32_t i = 0; i < block.bucket_count; ++i) {
++        uint64_t bucket_start = timestamps[block.buckets[i].start_query];
++        uint64_t bucket_end = timestamps[block.buckets[i].start_query + 1];
++        if (bucket_end <= bucket_start) {
++          continue;
++        }
++        if (block.buckets[i].kind == GpuTimestampBucket::kResolve) {
++          totals.resolve += bucket_end - bucket_start;
++          ++totals.resolves;
++        } else {
++          totals.swap += bucket_end - bucket_start;
++        }
++      }
++    }
++    profile->free_blocks.push_back(block_index);
++  }
++}
++
++void D3D12CommandProcessor::FinishGpuTimestampFrame() {
++  const GpuTimestampProfile* profile = gpu_timestamp_profile_.get();
++  if (!profile) {
++    return;
++  }
++  const GpuTimestampProfile::FrameTotals& totals = profile->frame_totals;
++  if (totals.frame == UINT64_MAX || !totals.submissions || !profile->frequency) {
++    return;
++  }
++  const double us_per_tick = 1000000.0 / double(profile->frequency);
++  auto to_us = [us_per_tick](uint64_t ticks) { return uint64_t(double(ticks) * us_per_tick + 0.5); };
++  using gpu_profile::GpuValue;
++  gpu_profile::AddGpuValue(GpuValue::kFrames, 1);
++  gpu_profile::AddGpuValue(GpuValue::kSubmissions, totals.submissions);
++  gpu_profile::AddGpuValue(GpuValue::kBusyUs, to_us(totals.busy));
++  gpu_profile::AddGpuValue(GpuValue::kSpanUs, to_us(totals.last_end - totals.first_start));
++  gpu_profile::AddGpuValue(GpuValue::kResolveUs, to_us(totals.resolve));
++  gpu_profile::AddGpuValue(GpuValue::kResolves, totals.resolves);
++  gpu_profile::AddGpuValue(GpuValue::kSwapUs, to_us(totals.swap));
++}
++
+ bool D3D12CommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out) {
+   // Don't let the cursor wrap onto indices whose results are still pending.
+   if (pending_occlusion_queries_.size() >= kMaxOcclusionQueries / 2) {
+diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
+index 2da52fb..9711a5d 100644
+--- a/src/graphics/d3d12/shared_memory.cpp
++++ b/src/graphics/d3d12/shared_memory.cpp
+@@ -17,6 +17,7 @@
+ #include <rex/cvar.h>
+ #include <rex/graphics/d3d12/command_processor.h>
+ #include <rex/graphics/d3d12/shared_memory.h>
++#include <rex/graphics/gpu_profile.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+@@ -400,6 +401,7 @@ bool D3D12SharedMemory::UploadRanges(
+       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
+                                        upload_buffer, UINT64(upload_buffer_offset),
+                                        UINT64(upload_buffer_size));
++      gpu_profile::AddValue(gpu_profile::Stage::kUploadBytes, upload_buffer_size);
+       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
+       upload_range_start += upload_buffer_pages;
+       upload_range_length -= upload_buffer_pages;

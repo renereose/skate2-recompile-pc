@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <memory>
 
+struct ImFont;
 struct ImFontAtlas;
 
 namespace rex::ui {
@@ -40,6 +41,10 @@ class Skate2SettingsPanel {
   // Adds the panel's font to the ImGui atlas. Call from
   // ReXApp::OnConfigureFonts; without it the panel scales the default font.
   static void ConfigureFonts(ImFontAtlas* atlas);
+
+  // The panel's font baked closest to size, or nullptr for the current font.
+  // For other Skate 2 overlays; use inside an ImGui frame.
+  static ImFont* FontForSize(float size);
 
   // Whether game input should be withheld: the panel is open, its controller
   // shortcut is being held, or a key or button used to close it has not been

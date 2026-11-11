@@ -1,0 +1,338 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 7f5cae2..baaf1a0 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -844,6 +844,24 @@ class D3D12CommandProcessor : public CommandProcessor {
+   // Last, so that the other members keep their offsets.
+   std::unique_ptr<GpuTimestampProfile> gpu_timestamp_profile_;
+   bool gpu_timestamp_profile_failed_ = false;
++
++  // d3d12_debug_drop_draws: a measurement probe that skips the host work of
++  // guest draws and resolves (see command_processor.cpp). The mode is latched
++  // at guest swaps, so a frame is either fully probed or not at all; while it
++  // is kOff, IssueDraw and EVENT_WRITE_ZPD test only this byte.
++  enum class DebugDropDraws : uint8_t { kOff, kFullscreen, kAll };
++  struct DebugDropDrawsStats;
++  void LatchDebugDropDraws();
++  // IssueDraw while the probe is active.
++  bool IssueDrawDebugDropDraws(xenos::PrimitiveType primitive_type, uint32_t index_count,
++                               IndexBufferInfo* index_buffer_info, bool major_mode_explicit);
++  // True if the current draw or resolve is dropped by the probe.
++  bool DebugDropDraw();
++  DebugDropDraws debug_drop_draws_ = DebugDropDraws::kOff;
++  // A guest occlusion query began while the probe was active, so its end gets
++  // the fake result as well, even if the probe was switched off in between.
++  bool debug_drop_query_open_ = false;
++  std::unique_ptr<DebugDropDrawsStats> debug_drop_draws_stats_;
+ };
+ 
+ }  // namespace rex::graphics::d3d12
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 66946ad..4c2cbe2 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -10,10 +10,14 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <cstdarg>
+ #include <cstring>
++#include <mutex>
+ #include <sstream>
++#include <string>
++#include <string_view>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+@@ -76,8 +80,94 @@ REXCVAR_DEFINE_BOOL(d3d12_gpu_timestamp_buckets, false, "GPU/D3D12",
+                     "submissions, EDRAM resolves, frame-end work) and log it every 120 frames")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// Measurement probe for "how fast could this run if translating guest draws
++// cost nothing". The screen stops updating while it is active.
++REXCVAR_DEFINE_STRING(d3d12_debug_drop_draws, "off", "GPU/D3D12",
++                      "Diagnostic probe, breaks the picture: skip the host work of guest draws "
++                      "and EDRAM resolves after shader analysis. off, fullscreen (only passes "
++                      "whose surface is at least d3d12_debug_drop_draws_min_pitch pixels wide) "
++                      "or all. PM4 processing, memory-export draws, fences and queries still "
++                      "run; occlusion queries report query_occlusion_fake_sample_count samples. "
++                      "Measures the frame time left when draw translation is removed. Applies "
++                      "at the next frame.")
++    .allowed({"off", "fullscreen", "all"})
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(d3d12_debug_drop_draws_min_pitch, 1024, "GPU/D3D12",
++                     "Surface width in guest pixels from which d3d12_debug_drop_draws=fullscreen "
++                     "drops a pass. The probe's log lists the widths drawn to.")
++    .range(1, 8192)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics::d3d12 {
+ 
++// d3d12_debug_drop_draws counters, logged every kLogInterval while the probe
++// is active. Only touched on the command processor thread.
++struct D3D12CommandProcessor::DebugDropDrawsStats {
++  static constexpr auto kLogInterval = std::chrono::seconds(5);
++  static constexpr uint32_t kMaxPitches = 16;
++  struct Pitch {
++    uint32_t pitch;
++    uint32_t dropped;
++    uint32_t executed;
++  };
++  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++  uint32_t frames = 0;
++  uint64_t dropped_draws = 0;
++  uint64_t executed_draws = 0;
++  uint64_t memexport_draws = 0;
++  uint64_t dropped_resolves = 0;
++  uint64_t executed_resolves = 0;
++  uint64_t fake_queries = 0;
++  uint32_t pitch_count = 0;
++  uint32_t other_pitches = 0;
++  Pitch pitches[kMaxPitches];
++
++  void CountPitch(uint32_t pitch, bool dropped) {
++    for (uint32_t i = 0; i < pitch_count; ++i) {
++      if (pitches[i].pitch == pitch) {
++        ++(dropped ? pitches[i].dropped : pitches[i].executed);
++        return;
++      }
++    }
++    if (pitch_count < kMaxPitches) {
++      pitches[pitch_count++] = {pitch, dropped ? 1u : 0u, dropped ? 0u : 1u};
++    } else {
++      ++other_pitches;
++    }
++  }
++};
++
++namespace {
++
++// d3d12_debug_drop_draws as last set, published by its change callback and
++// read by the command processor once per guest frame. Values of
++// D3D12CommandProcessor::DebugDropDraws.
++std::atomic<uint8_t> g_debug_drop_draws_request{0};
++
++uint8_t ParseDebugDropDraws(std::string_view value) {
++  if (value == "all") {
++    return 2;
++  }
++  if (value == "fullscreen") {
++    return 1;
++  }
++  return 0;
++}
++
++const char* DebugDropDrawsName(uint8_t mode) {
++  switch (mode) {
++    case 1:
++      return "fullscreen";
++    case 2:
++      return "all";
++    default:
++      return "off";
++  }
++}
++
++}  // namespace
++
+ // Generated with `xb buildshaders`.
+ namespace shaders {
+ #include "../shaders/bytecode/d3d12_5_1/apply_gamma_pwl_cs.h"
+@@ -221,6 +311,41 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
+ 
+ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
+                                                                uint32_t packet, uint32_t count) {
++  // d3d12_debug_drop_draws: the draws between a query's begin and end are
++  // dropped, so a host query would count no samples and the game would treat
++  // what it queried as hidden. Give the guest the fixed sample count of the
++  // fallback path instead, for every query that began while probing.
++  if (debug_drop_draws_ != DebugDropDraws::kOff || debug_drop_query_open_) [[unlikely]] {
++    const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
++    auto* sample_counts = memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(
++        register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
++    const bool is_end = sample_counts && (sample_counts->ZPass_A == kQueryFinished ||
++                                          sample_counts->ZPass_B == kQueryFinished ||
++                                          sample_counts->ZFail_A == kQueryFinished ||
++                                          sample_counts->ZFail_B == kQueryFinished);
++    if (debug_drop_draws_ != DebugDropDraws::kOff || is_end) {
++      // Results of queries that ended before the probe started.
++      ProcessPendingOcclusionQueries(false);
++      if (active_occlusion_query_.valid) {
++        // Begun before the probe started: close the host query, which is in
++        // the open submission, and report the fake count at its end too.
++        const uint32_t host_index = active_occlusion_query_.host_index;
++        active_occlusion_query_ = {};
++        if (occlusion_query_heap_ && BeginSubmission(true)) {
++          deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(),
++                                             D3D12_QUERY_TYPE_OCCLUSION, host_index);
++        }
++      }
++      debug_drop_query_open_ = !is_end;
++      if (is_end && debug_drop_draws_stats_) {
++        ++debug_drop_draws_stats_->fake_queries;
++      }
++      return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
++    }
++    // Probe off, and a new query begins: back to host queries.
++    debug_drop_query_open_ = false;
++  }
++
+   if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
+     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
+   }
+@@ -934,6 +1059,21 @@ bool D3D12CommandProcessor::SetupContext() {
+   // Snapshot through the locked registry once on the command worker. Pending
+   // UI edits to this restart-required flag must not race live packet handling.
+   present_idleclean_sync_enabled_ = rex::cvar::Query<bool>("d3d12_present_idleclean_sync");
++  // d3d12_debug_drop_draws is a string, read through the registry lock here
++  // and in its change callback rather than on this thread every frame.
++  static std::once_flag debug_drop_draws_callback;
++  std::call_once(debug_drop_draws_callback, [] {
++    rex::cvar::RegisterChangeCallback("d3d12_debug_drop_draws",
++                                      [](std::string_view, std::string_view value) {
++                                        g_debug_drop_draws_request.store(
++                                            ParseDebugDropDraws(value), std::memory_order_relaxed);
++                                      });
++  });
++  g_debug_drop_draws_request.store(
++      ParseDebugDropDraws(rex::cvar::GetFlagByName("d3d12_debug_drop_draws")),
++      std::memory_order_relaxed);
++  debug_drop_draws_ = DebugDropDraws::kOff;
++  debug_drop_query_open_ = false;
+ 
+   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+   ID3D12Device* device = provider.GetDevice();
+@@ -2088,6 +2228,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   SCOPE_profile_cpu_f("gpu");
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
++  // d3d12_debug_drop_draws applies to whole frames.
++  LatchDebugDropDraws();
+ 
+   if (!graphics_system_)
+     return;
+@@ -2957,6 +3099,12 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type,
+ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
+                                       IndexBufferInfo* index_buffer_info,
+                                       bool major_mode_explicit) {
++  // One byte test per draw while d3d12_debug_drop_draws is off. The probe's
++  // path is a separate function, so this one stays a tail call.
++  if (debug_drop_draws_ != DebugDropDraws::kOff) [[unlikely]] {
++    return IssueDrawDebugDropDraws(primitive_type, index_count, index_buffer_info,
++                                   major_mode_explicit);
++  }
+   // One flag check per draw while gpu_cpu_profile is off.
+   if (gpu_profile::Enabled()) [[unlikely]] {
+     return IssueDrawImpl<true>(primitive_type, index_count, index_buffer_info,
+@@ -2965,6 +3113,108 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   return IssueDrawImpl<false>(primitive_type, index_count, index_buffer_info, major_mode_explicit);
+ }
+ 
++__attribute__((noinline)) bool D3D12CommandProcessor::IssueDrawDebugDropDraws(
++    xenos::PrimitiveType primitive_type, uint32_t index_count, IndexBufferInfo* index_buffer_info,
++    bool major_mode_explicit) {
++  if (DebugDropDraw()) {
++    return true;
++  }
++  if (gpu_profile::Enabled()) {
++    return IssueDrawImpl<true>(primitive_type, index_count, index_buffer_info,
++                               major_mode_explicit);
++  }
++  return IssueDrawImpl<false>(primitive_type, index_count, index_buffer_info, major_mode_explicit);
++}
++
++void D3D12CommandProcessor::LatchDebugDropDraws() {
++  const auto requested =
++      DebugDropDraws(g_debug_drop_draws_request.load(std::memory_order_relaxed));
++  DebugDropDrawsStats* stats = debug_drop_draws_stats_.get();
++  if (requested != debug_drop_draws_) {
++    REXGPU_INFO("d3d12_debug_drop_draws: {} -> {} (fullscreen = surfaces from {} pixels wide)",
++                DebugDropDrawsName(uint8_t(debug_drop_draws_)), DebugDropDrawsName(uint8_t(requested)),
++                REXCVAR_GET(d3d12_debug_drop_draws_min_pitch));
++    debug_drop_draws_ = requested;
++    if (requested != DebugDropDraws::kOff) {
++      if (!stats) {
++        debug_drop_draws_stats_ = std::make_unique<DebugDropDrawsStats>();
++      } else {
++        *stats = DebugDropDrawsStats();
++      }
++    }
++    return;
++  }
++  if (debug_drop_draws_ == DebugDropDraws::kOff || !stats) {
++    return;
++  }
++  ++stats->frames;
++  if (std::chrono::steady_clock::now() - stats->start < DebugDropDrawsStats::kLogInterval) {
++    return;
++  }
++  const double frames = double(stats->frames);
++  std::string surfaces;
++  for (uint32_t i = 0; i < stats->pitch_count; ++i) {
++    const DebugDropDrawsStats::Pitch& pitch = stats->pitches[i];
++    surfaces += fmt::format("{}{}: {:.0f}/{:.0f}", i ? ", " : "", pitch.pitch,
++                            double(pitch.dropped) / frames, double(pitch.executed) / frames);
++  }
++  if (stats->other_pitches) {
++    surfaces += fmt::format(", other widths: {:.0f}", double(stats->other_pitches) / frames);
++  }
++  REXGPU_INFO(
++      "d3d12_debug_drop_draws={}: per frame {:.0f} draws dropped, {:.0f} executed ({:.0f} memory "
++      "export), resolves {:.1f} dropped / {:.1f} executed, {:.1f} fake query results; draws by "
++      "surface width, dropped/executed: {}",
++      DebugDropDrawsName(uint8_t(debug_drop_draws_)), double(stats->dropped_draws) / frames,
++      double(stats->executed_draws + stats->memexport_draws) / frames,
++      double(stats->memexport_draws) / frames, double(stats->dropped_resolves) / frames,
++      double(stats->executed_resolves) / frames, double(stats->fake_queries) / frames, surfaces);
++  *stats = DebugDropDrawsStats();
++}
++
++bool D3D12CommandProcessor::DebugDropDraw() {
++  const RegisterFile& regs = *register_file_;
++  DebugDropDrawsStats& stats = *debug_drop_draws_stats_;
++  const uint32_t pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
++  const bool pass_dropped =
++      debug_drop_draws_ == DebugDropDraws::kAll ||
++      pitch >= uint32_t(REXCVAR_GET(d3d12_debug_drop_draws_min_pitch));
++  const xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
++  if (edram_mode == xenos::EdramMode::kCopy) {
++    // A resolve of a dropped pass would copy stale EDRAM contents.
++    ++(pass_dropped ? stats.dropped_resolves : stats.executed_resolves);
++    return pass_dropped;
++  }
++  if (!pass_dropped) {
++    ++stats.executed_draws;
++    stats.CountPitch(pitch, false);
++    return false;
++  }
++  // Memory export writes guest memory that the game may read back, so those
++  // draws still run. Shader analysis is cached in the shader.
++  auto* vertex_shader = static_cast<D3D12Shader*>(active_vertex_shader());
++  if (!vertex_shader) {
++    return false;
++  }
++  pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
++  bool memexport = vertex_shader->memexport_eM_written() != 0;
++  if (!memexport && edram_mode == xenos::EdramMode::kColorDepth) {
++    auto* pixel_shader = static_cast<D3D12Shader*>(active_pixel_shader());
++    if (pixel_shader) {
++      pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
++      memexport = pixel_shader->memexport_eM_written() != 0;
++    }
++  }
++  if (memexport) {
++    ++stats.memexport_draws;
++    stats.CountPitch(pitch, false);
++    return false;
++  }
++  ++stats.dropped_draws;
++  stats.CountPitch(pitch, true);
++  return true;
++}
++
+ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
+   if (!total_size || memexport_ranges_.empty()) {
+     return true;

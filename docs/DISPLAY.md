@@ -17,6 +17,10 @@ Use **Launch Skate 2.exe** in the player-package root for the default profile. T
 
 All supplied profiles enable synchronous shader compilation and GPU idle-clean synchronization. Opening `skate2.exe` directly uses the same default profile, including these synchronization settings, and the same saved settings. It skips the launcher's checks for the game files and the Visual C++ runtime.
 
+The default profile also turns off the runtime's frame-end refresh of memory page state (`clear_memory_page_state`). With it on, about 15 MB of game memory was uploaded again every frame in Free Skate; turning it off raised a busy Free Skate spot from 88 to 100 FPS at 2x on the test PC and cut the GPU's work per frame by almost two thirds. See [Memory page state refresh](PERFORMANCE.md#memory-page-state-refresh). If geometry, textures or effects look stale, flicker or go missing, set `clear_memory_page_state = true` in `skate2.toml` to restore the refresh.
+
+The default profile also draws the main scene once instead of in the console's two framebuffer strips (`gpu_tiled_scene_single_pass`). In the same Free Skate spot this raised the test PC from 176 to 224 FPS at 2x, and the Steam Deck from 35 to 46 FPS. See [Single-pass tiled scenes](PERFORMANCE.md#single-pass-tiled-scenes). If the bottom sixth of the screen looks missing, stale or wrongly shaded, set `gpu_tiled_scene_single_pass = false` in `skate2.toml` to draw it strip by strip again.
+
 Earlier versions of the default launchers always passed unlimited, 2x and ROV, which overrode saved values. Settings saved before, for example a frame-rate mode, render scale or render path saved from F4, now take effect. If the game starts with different settings than before, check them in the settings panel (F1).
 
 The native EXE runs the existing PowerShell startup logic. v0.1.1 changes the entrypoint and packaging while preserving the v0.1.0 game/runtime binaries and graphics fixes.

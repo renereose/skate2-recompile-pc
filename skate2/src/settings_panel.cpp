@@ -1377,6 +1377,10 @@ void Skate2SettingsPanel::ConfigureFonts(ImFontAtlas* atlas) {
 #endif
 }
 
+ImFont* Skate2SettingsPanel::FontForSize(float size) {
+  return ChooseFont(size);
+}
+
 bool Skate2SettingsPanel::BlocksGameInput() {
   if (g_panel_open.load(std::memory_order_acquire)) return true;
   if (g_shortcut_held.load(std::memory_order_acquire)) return true;

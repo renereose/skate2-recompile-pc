@@ -1,0 +1,982 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index f881ae5..9971bde 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -111,6 +111,15 @@ class D3D12CommandProcessor : public CommandProcessor {
+       GpuPassMarkWork(work, UINT32_MAX);
+     }
+   }
++  // After work done for a draw before its pass is known (render target
++  // transfers): what follows is that draw's, and the transfers are attributed
++  // to its pass rather than to the pass of the previous draw.
++  static constexpr uint32_t kGpuPassPendingDraw = UINT32_MAX - 1;
++  void GpuPassMarkDrawSetup() {
++    if (gpu_pass_block_ != UINT32_MAX) [[unlikely]] {
++      GpuPassMarkWork(GpuPassWork::kDraw, kGpuPassPendingDraw);
++    }
++  }
+   class GpuPassScope {
+    public:
+     GpuPassScope(D3D12CommandProcessor& command_processor, GpuPassWork work)
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index 16122ca..dc1c645 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -178,6 +178,17 @@ class RenderTargetCache {
+   virtual bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+                       uint32_t normalized_color_mask, const Shader& vertex_shader);
+ 
++  // gpu_render_target_transfer_skip_overwritten: the pixel shader of the draw
++  // of the next Update (nullptr if it's drawn without one). Transfers are only
++  // skipped for draws after which this has been called.
++  void SetUpdatePixelShader(const Shader* pixel_shader) {
++    update_pixel_shader_ = pixel_shader;
++    update_pixel_shader_set_ = true;
++  }
++
++  // Frame boundary for the gpu_render_target_transfer_log statistics.
++  void TransferLogFrame();
++
+   // Returns bits where 0 is whether a depth render target is currently bound on
+   // the host and 1... are whether the same applies to color render targets, and
+   // formats (resource formats, but if needed, with gamma taken into account) of
+@@ -509,6 +520,17 @@ class RenderTargetCache {
+     assert_true(GetPath() == Path::kHostRenderTargets);
+     return last_update_transfers_;
+   }
++  // gpu_render_target_transfer_skip_overwritten: after an update, the render
++  // targets (bit 0 for depth, 1... for color) for which the draw writes every
++  // sample in cutout_out - their transfers must exclude it (pass it as the
++  // cutout rectangle), and transfers fully inside it have been dropped.
++  uint32_t GetLastUpdateTransferCutout(Transfer::Rectangle& cutout_out) const {
++    cutout_out = last_update_transfer_cutout_;
++    return last_update_transfer_cutout_rts_;
++  }
++  // gpu_render_target_transfer_skip_overwritten_validate: fill the cutout
++  // before the draw so areas it doesn't overwrite show up.
++  static bool IsTransferCutoutValidationEnabled();
+ 
+   HostDepthStoreRenderTargetConstant GetHostDepthStoreRenderTargetConstant(
+       uint32_t pitch_tiles, bool msaa_2x_supported) const {
+@@ -698,6 +720,32 @@ class RenderTargetCache {
+   // consecutive in the array.
+   std::vector<Transfer> last_update_transfers_[1 + xenos::kMaxColorRenderTargets];
+ 
++  // gpu_render_target_transfer_skip_overwritten and
++  // gpu_render_target_transfer_log, after the ownership changes of an update.
++  void CutOutTransfersOverwrittenByDraw(uint32_t rts_used_bits, RenderTarget* const* rts,
++                                        reg::RB_DEPTHCONTROL normalized_depth_control,
++                                        uint32_t normalized_color_mask,
++                                        const Shader& vertex_shader, const Shader* pixel_shader,
++                                        bool pixel_shader_known, uint32_t height_used);
++  const Shader* update_pixel_shader_ = nullptr;
++  bool update_pixel_shader_set_ = false;
++  uint32_t last_update_transfer_cutout_rts_ = 0;
++  Transfer::Rectangle last_update_transfer_cutout_ = {};
++  struct TransferStats {
++    uint64_t updates_with_transfers = 0;
++    uint64_t transfers = 0;
++    uint64_t transfers_dropped = 0;
++    uint64_t transfers_cut = 0;
++    // In guest samples.
++    uint64_t samples_needed = 0;
++    uint64_t samples_copied = 0;
++  };
++  TransferStats transfer_stats_;
++  uint64_t transfer_log_frame_ = 0;
++  uint32_t transfer_log_frames_ = 0;
++  uint32_t transfer_log_draw_ = 0;
++  bool transfer_log_this_frame_ = false;
++
+   // gpu_render_target_update_cache: consecutive draws usually bind the same
+   // render targets over an EDRAM range they already own. When the bindings
+   // derived from the registers are the same as for the previous successful
+diff --git a/include/rex/graphics/util/draw_extent_estimator.h b/include/rex/graphics/util/draw_extent_estimator.h
+index 5a2adac..c659812 100644
+--- a/include/rex/graphics/util/draw_extent_estimator.h
++++ b/include/rex/graphics/util/draw_extent_estimator.h
+@@ -39,6 +39,24 @@ class DrawExtentEstimator {
+   uint32_t EstimateVertexMaxY(const Shader& vertex_shader);
+   uint32_t EstimateMaxY(bool try_to_estimate_vertex_max_y, const Shader& vertex_shader);
+ 
++  // A rectangle of render target pixels, right and bottom exclusive.
++  struct PixelRect {
++    uint32_t left;
++    uint32_t top;
++    uint32_t right;
++    uint32_t bottom;
++  };
++  // gpu_render_target_transfer_skip_overwritten: finds pixels of which the
++  // host rasterizes every sample for the current draw, from its vertex
++  // positions computed on the CPU, before the scissor, depth, stencil, color
++  // mask and pixel shader effects, which the caller checks. Only for draws of
++  // one rectangle (rectangle list), or of one or two triangles without face
++  // culling. If the primitives form one axis-aligned rectangle, that rectangle
++  // is returned, otherwise needed_rect if a triangle contains it. Returns
++  // nullptr on success, or the reason the coverage wasn't proven.
++  const char* GetDrawFullCoverage(const Shader& vertex_shader, const PixelRect& needed_rect,
++                                  PixelRect& covered_out);
++
+  private:
+   class PositionYExportSink : public ShaderInterpreter::ExportSink {
+    public:
+@@ -46,18 +64,24 @@ class DrawExtentEstimator {
+                 uint32_t value_mask) override;
+ 
+     void Reset() {
++      position_x_.reset();
+       position_y_.reset();
++      position_z_.reset();
+       position_w_.reset();
+       point_size_.reset();
+       vertex_kill_.reset();
+     }
+ 
++    const std::optional<float>& position_x() const { return position_x_; }
+     const std::optional<float>& position_y() const { return position_y_; }
++    const std::optional<float>& position_z() const { return position_z_; }
+     const std::optional<float>& position_w() const { return position_w_; }
+     const std::optional<float>& point_size() const { return point_size_; }
+     const std::optional<uint32_t>& vertex_kill() const { return vertex_kill_; }
+ 
+    private:
++    std::optional<float> position_x_;
++    std::optional<float> position_z_;
+     std::optional<float> position_y_;
+     std::optional<float> position_w_;
+     std::optional<float> point_size_;
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 6a4e32b..6f2b752 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -2918,6 +2918,7 @@ bool D3D12CommandProcessor::IssueDrawImpl(xenos::PrimitiveType primitive_type,
+   uint32_t normalized_color_mask =
+       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                    : 0;
++  render_target_cache_->SetUpdatePixelShader(pixel_shader);
+   bool render_targets_updated = render_target_cache_->Update(
+       is_rasterization_done, normalized_depth_control, normalized_color_mask, *vertex_shader);
+   profile_laps.Mark(gpu_profile::Stage::kDrawRenderTarget);
+@@ -4107,6 +4108,8 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+     primitive_processor_->BeginFrame();
+ 
+     texture_cache_->BeginFrame();
++
++    render_target_cache_->TransferLogFrame();
+   }
+ 
+   return true;
+@@ -6335,6 +6338,13 @@ void D3D12CommandProcessor::GpuPassMarkDraw(reg::RB_DEPTHCONTROL normalized_dept
+   draw_util::GetScissor(regs, scissor);
+   block_pass.right = std::max(block_pass.right, scissor.offset[0] + scissor.extent[0]);
+   block_pass.bottom = std::max(block_pass.bottom, scissor.offset[1] + scissor.extent[1]);
++  if (profile.work == GpuPassWork::kDraw && profile.work_pass == kGpuPassPendingDraw) {
++    // The open segment, after this draw's render target transfers, already
++    // contains its setup - it's this draw's.
++    block.segments.back().pass = profile.block_pass;
++    profile.work_pass = profile.block_pass;
++    return;
++  }
+   GpuPassMarkWork(GpuPassWork::kDraw, profile.block_pass);
+ }
+ 
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index 50d839d..ea37630 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -1073,18 +1073,57 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
+       // here), PerformTransfersAndResolveClears does nothing, and it is called
+       // for every draw.
+       const std::vector<Transfer>* transfers = last_update_transfers();
+-      bool any_transfers = false;
++      uint32_t transfer_rts = 0;
+       for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+         if (!transfers[i].empty()) {
+-          any_transfers = true;
+-          break;
++          transfer_rts |= uint32_t(1) << i;
+         }
+       }
+-      if (any_transfers) {
++      // gpu_render_target_transfer_skip_overwritten: the draw writes every
++      // sample of the cutout in these render targets, so their transfers
++      // exclude it.
++      Transfer::Rectangle transfer_cutout;
++      uint32_t cutout_rts = GetLastUpdateTransferCutout(transfer_cutout);
++      bool cutout_validation = cutout_rts && IsTransferCutoutValidationEnabled();
++      if (transfer_rts || cutout_validation) {
+         D3D12CommandProcessor::GpuPassScope gpu_pass_transfer(
+             command_processor_, D3D12CommandProcessor::GpuPassWork::kTransfer);
+-        PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+-                                         depth_and_color_render_targets, transfers);
++        uint32_t plain_rts = transfer_rts & ~cutout_rts;
++        uint32_t cut_rts = cutout_rts & (cutout_validation ? ~uint32_t(0) : transfer_rts);
++        RenderTarget* selected_render_targets[1 + xenos::kMaxColorRenderTargets];
++        auto select_render_targets = [&](uint32_t bits) {
++          for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
++            selected_render_targets[i] =
++                (bits & (uint32_t(1) << i)) ? depth_and_color_render_targets[i] : nullptr;
++          }
++        };
++        if (!cut_rts) {
++          PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
++                                           depth_and_color_render_targets, transfers);
++        } else {
++          if (plain_rts) {
++            select_render_targets(plain_rts);
++            PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
++                                             selected_render_targets, transfers);
++          }
++          select_render_targets(cut_rts);
++          // Validation: magenta color (any format), nearest depth, stencil 0 -
++          // all to be replaced by the draw.
++          uint64_t validation_fill[1 + xenos::kMaxColorRenderTargets];
++          validation_fill[0] = 0;
++          for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
++            validation_fill[i] = UINT64_C(0xFFFF00FFFFFF00FF);
++          }
++          PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
++                                           selected_render_targets, transfers,
++                                           cutout_validation ? validation_fill : nullptr,
++                                           &transfer_cutout);
++        }
++      }
++      if (transfer_rts || cutout_validation) {
++        // The draw setup recorded from here on belongs to the draw that needed
++        // the transfers, not to the previous draw.
++        command_processor_.GpuPassMarkDrawSetup();
+       }
+       SetCommandListRenderTargets(depth_and_color_render_targets);
+     } break;
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 2724cc2..9196999 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -47,6 +47,30 @@ REXCVAR_DEFINE_BOOL(gpu_render_target_update_cache, true, "GPU",
+                     "their EDRAM ownership since")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(gpu_render_target_transfer_skip_overwritten, true, "GPU",
++                    "Host render targets: when a draw takes over an EDRAM area from another "
++                    "render target, don't copy the old contents of the part the draw itself "
++                    "replaces at every sample (full-screen clears and copies: one rectangle, or "
++                    "one or two triangles without face culling, always passing depth and stencil "
++                    "tests replacing depth and all stencil bits, all color channels written "
++                    "without blending, no pixel discarding). The rest of the area is still "
++                    "copied.")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(gpu_render_target_transfer_skip_overwritten_validate, false, "GPU",
++                    "Diagnostic for gpu_render_target_transfer_skip_overwritten, changes the "
++                    "picture only if that's wrong: fill each area it doesn't copy with magenta "
++                    "color and the nearest depth just before the draw. Magenta or missing "
++                    "geometry on screen means the draw did not replace the area.")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(gpu_render_target_transfer_log, 0, "GPU",
++                     "Every this many frames, log the host render target ownership transfers of "
++                     "one frame with the state of the draws needing them, and transfer totals per "
++                     "frame. 0 is off.")
++    .range(0, 1000000)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics {
+ 
+ void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format,
+@@ -413,6 +437,12 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
+   const RegisterFile& regs = register_file();
+   bool interlock_barrier_only = GetPathCommon() == Path::kPixelShaderInterlock;
++  // Consumed by every update, only valid for its draw.
++  const Shader* const pixel_shader = update_pixel_shader_;
++  const bool pixel_shader_known = update_pixel_shader_set_;
++  update_pixel_shader_set_ = false;
++  last_update_transfer_cutout_rts_ = 0;
++  ++transfer_log_draw_;
+ 
+   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
+@@ -796,6 +826,10 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+     return true;
+   }
+ 
++  CutOutTransfersOverwrittenByDraw(depth_and_color_rts_used_bits, rts, normalized_depth_control,
++                                   normalized_color_mask, vertex_shader, pixel_shader,
++                                   pixel_shader_known, height_used);
++
+   // If everything succeeded, update the used render targets.
+   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+     last_update_used_render_targets_[i] =
+@@ -863,6 +897,301 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+   return true;
+ }
+ 
++bool RenderTargetCache::IsTransferCutoutValidationEnabled() {
++  return REXCVAR_GET(gpu_render_target_transfer_skip_overwritten_validate);
++}
++
++void RenderTargetCache::TransferLogFrame() {
++  transfer_log_this_frame_ = false;
++  transfer_log_draw_ = 0;
++  int32_t interval = REXCVAR_GET(gpu_render_target_transfer_log);
++  if (interval <= 0) {
++    transfer_log_frames_ = 0;
++    transfer_stats_ = {};
++    return;
++  }
++  ++transfer_log_frame_;
++  if (++transfer_log_frames_ < uint32_t(interval)) {
++    return;
++  }
++  const TransferStats& stats = transfer_stats_;
++  double frames = double(transfer_log_frames_);
++  REXGPU_INFO(
++      "Render target transfers (avg per frame over {} frames): {:.1f} draws needing them, {:.1f} "
++      "transfers, {:.1f} dropped and {:.1f} cut by the draw overwriting them, {:.0f} of {:.0f} "
++      "thousand samples copied ({:.0f}%), gpu_render_target_transfer_skip_overwritten {}",
++      transfer_log_frames_, double(stats.updates_with_transfers) / frames,
++      double(stats.transfers) / frames, double(stats.transfers_dropped) / frames,
++      double(stats.transfers_cut) / frames, double(stats.samples_copied) / frames / 1000.0,
++      double(stats.samples_needed) / frames / 1000.0,
++      stats.samples_needed ? 100.0 * double(stats.samples_copied) / double(stats.samples_needed)
++                           : 100.0,
++      REXCVAR_GET(gpu_render_target_transfer_skip_overwritten));
++  transfer_stats_ = {};
++  transfer_log_frames_ = 0;
++  // The next frame's transfers in detail.
++  transfer_log_this_frame_ = true;
++}
++
++void RenderTargetCache::CutOutTransfersOverwrittenByDraw(
++    uint32_t rts_used_bits, RenderTarget* const* rts, reg::RB_DEPTHCONTROL normalized_depth_control,
++    uint32_t normalized_color_mask, const Shader& vertex_shader, const Shader* pixel_shader,
++    bool pixel_shader_known, uint32_t height_used) {
++  uint32_t rts_with_transfers = 0;
++  uint32_t rts_remaining = rts_used_bits;
++  uint32_t rt_index;
++  while (rex::bit_scan_forward(rts_remaining, &rt_index)) {
++    rts_remaining &= ~(uint32_t(1) << rt_index);
++    if (!last_update_transfers_[rt_index].empty()) {
++      rts_with_transfers |= uint32_t(1) << rt_index;
++    }
++  }
++  if (!rts_with_transfers) {
++    return;
++  }
++  const bool skip_enabled = REXCVAR_GET(gpu_render_target_transfer_skip_overwritten);
++  const bool stats_enabled = REXCVAR_GET(gpu_render_target_transfer_log) > 0;
++  if (!skip_enabled && !stats_enabled) {
++    return;
++  }
++  const bool log_draw = stats_enabled && transfer_log_this_frame_;
++  auto describe_render_target = [](RenderTargetKey key) -> std::string {
++    uint32_t pitch_pixels = key.pitch_tiles_at_32bpp *
++                            (xenos::kEdramTileWidthSamples >>
++                             uint32_t(key.msaa_samples >= xenos::MsaaSamples::k4X));
++    return fmt::format(
++        "{} {}@{} pitch {} {}x", key.is_depth ? "depth" : "color",
++        key.is_depth ? xenos::GetDepthRenderTargetFormatName(key.GetDepthFormat())
++                     : xenos::GetColorRenderTargetFormatName(key.GetColorFormat()),
++        uint32_t(key.base_tiles), pitch_pixels, uint32_t(1) << uint32_t(key.msaa_samples));
++  };
++
++  const RegisterFile& regs = register_file();
++  const uint32_t sample_count_log2 = uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples);
++  auto get_rectangles = [&](uint32_t rt, const Transfer& transfer,
++                            Transfer::Rectangle* rectangles_out,
++                            const Transfer::Rectangle* cutout) -> uint32_t {
++    RenderTargetKey key = rts[rt]->key();
++    return transfer.GetRectangles(key.base_tiles, key.GetPitchTiles(), key.msaa_samples,
++                                  key.Is64bpp(), rectangles_out, cutout);
++  };
++  auto get_samples = [&](uint32_t rt, const Transfer& transfer,
++                         const Transfer::Rectangle* cutout) -> uint64_t {
++    Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
++    uint32_t rectangle_count = get_rectangles(rt, transfer, rectangles, cutout);
++    uint64_t pixels = 0;
++    for (uint32_t i = 0; i < rectangle_count; ++i) {
++      pixels += uint64_t(rectangles[i].width_pixels) * rectangles[i].height_pixels;
++    }
++    return pixels << sample_count_log2;
++  };
++
++  // The area needed by all the transfers.
++  DrawExtentEstimator::PixelRect needed = {UINT32_MAX, UINT32_MAX, 0, 0};
++  rts_remaining = rts_with_transfers;
++  while (rex::bit_scan_forward(rts_remaining, &rt_index)) {
++    rts_remaining &= ~(uint32_t(1) << rt_index);
++    for (const Transfer& transfer : last_update_transfers_[rt_index]) {
++      Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithoutCutout];
++      uint32_t rectangle_count = get_rectangles(rt_index, transfer, rectangles, nullptr);
++      for (uint32_t i = 0; i < rectangle_count; ++i) {
++        const Transfer::Rectangle& rectangle = rectangles[i];
++        needed.left = std::min(needed.left, rectangle.x_pixels);
++        needed.top = std::min(needed.top, rectangle.y_pixels);
++        needed.right = std::max(needed.right, rectangle.x_pixels + rectangle.width_pixels);
++        needed.bottom = std::max(needed.bottom, rectangle.y_pixels + rectangle.height_pixels);
++      }
++    }
++  }
++
++  // Whether the draw replaces every sample of a rectangle (the cutout) in all
++  // or some of the render targets.
++  const char* draw_reason = nullptr;
++  const char* rt_reasons[1 + xenos::kMaxColorRenderTargets] = {};
++  uint32_t overwritten_rts = 0;
++  Transfer::Rectangle cutout = {};
++  draw_util::Scissor scissor;
++  draw_util::GetScissor(regs, scissor);
++  auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
++  if (!pixel_shader_known) {
++    draw_reason = "not supported by the backend";
++  } else if (pixel_shader && pixel_shader->kills_pixels()) {
++    draw_reason = "pixel shader discards";
++  } else if (pixel_shader && rb_colorcontrol.alpha_test_enable &&
++             rb_colorcontrol.alpha_func != xenos::CompareFunction::kAlways) {
++    draw_reason = "alpha test";
++  } else if (pixel_shader && rb_colorcontrol.alpha_to_mask_enable) {
++    draw_reason = "alpha to coverage";
++  } else {
++    DrawExtentEstimator::PixelRect needed_in_scissor;
++    needed_in_scissor.left = std::max(needed.left, scissor.offset[0]);
++    needed_in_scissor.top = std::max(needed.top, scissor.offset[1]);
++    needed_in_scissor.right = std::min(needed.right, scissor.offset[0] + scissor.extent[0]);
++    needed_in_scissor.bottom = std::min(needed.bottom, scissor.offset[1] + scissor.extent[1]);
++    DrawExtentEstimator::PixelRect covered;
++    if (needed_in_scissor.right <= needed_in_scissor.left ||
++        needed_in_scissor.bottom <= needed_in_scissor.top) {
++      draw_reason = "scissor outside the area";
++    } else {
++      draw_reason =
++          draw_extent_estimator_.GetDrawFullCoverage(vertex_shader, needed_in_scissor, covered);
++    }
++    if (!draw_reason) {
++      uint32_t left = std::max(covered.left, scissor.offset[0]);
++      uint32_t top = std::max(covered.top, scissor.offset[1]);
++      uint32_t right = std::min(covered.right, scissor.offset[0] + scissor.extent[0]);
++      uint32_t bottom = std::min(covered.bottom, scissor.offset[1] + scissor.extent[1]);
++      if (right <= left || bottom <= top) {
++        draw_reason = "covered area outside the scissor";
++      } else {
++        cutout.x_pixels = left;
++        cutout.y_pixels = top;
++        cutout.width_pixels = right - left;
++        cutout.height_pixels = bottom - top;
++      }
++    }
++  }
++  if (!draw_reason) {
++    bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
++    rts_remaining = rts_with_transfers;
++    while (rex::bit_scan_forward(rts_remaining, &rt_index)) {
++      rts_remaining &= ~(uint32_t(1) << rt_index);
++      const char* reason = nullptr;
++      if (!rt_index) {
++        const reg::RB_DEPTHCONTROL& depth_control = normalized_depth_control;
++        if (!depth_control.z_enable || !depth_control.z_write_enable ||
++            depth_control.zfunc != xenos::CompareFunction::kAlways) {
++          reason = "depth not always replaced";
++        } else if (!depth_control.stencil_enable ||
++                   depth_control.stencilfunc != xenos::CompareFunction::kAlways ||
++                   depth_control.stencilzpass != xenos::StencilOp::kReplace) {
++          reason = "stencil not always replaced";
++        } else if (primitive_polygonal && depth_control.backface_enable &&
++                   (depth_control.stencilfunc_bf != xenos::CompareFunction::kAlways ||
++                    depth_control.stencilzpass_bf != xenos::StencilOp::kReplace)) {
++          reason = "back face stencil not always replaced";
++        } else if (regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask != 0xFF) {
++          // Face culling is excluded, the host uses the front face masks.
++          reason = "stencil write mask";
++        }
++      } else {
++        uint32_t color_index = rt_index - 1;
++        if (((normalized_color_mask >> (4 * color_index)) & 0b1111) != 0b1111) {
++          reason = "color write mask";
++        } else {
++          auto blendcontrol =
++              regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[color_index]);
++          if (blendcontrol.color_srcblend != xenos::BlendFactor::kOne ||
++              blendcontrol.color_destblend != xenos::BlendFactor::kZero ||
++              blendcontrol.color_comb_fcn != xenos::BlendOp::kAdd ||
++              blendcontrol.alpha_srcblend != xenos::BlendFactor::kOne ||
++              blendcontrol.alpha_destblend != xenos::BlendFactor::kZero ||
++              blendcontrol.alpha_comb_fcn != xenos::BlendOp::kAdd) {
++            reason = "blending";
++          }
++        }
++      }
++      if (reason) {
++        rt_reasons[rt_index] = reason;
++      } else {
++        overwritten_rts |= uint32_t(1) << rt_index;
++      }
++    }
++  }
++
++  const bool apply = skip_enabled && overwritten_rts;
++  if (log_draw) {
++    auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
++    auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
++    REXGPU_INFO(
++        "Render target transfers in frame {}, draw {}: primitive {} x{}, scissor {},{} {}x{}, "
++        "height {}, depth control {:08X} stencil ref/mask {:08X}, color mask {:04X}, blend0 "
++        "{:08X}, color control {:08X}, pixel shader {}, clip {}, cull {}{} - {}",
++        transfer_log_frame_, transfer_log_draw_, uint32_t(vgt_draw_initiator.prim_type),
++        uint32_t(vgt_draw_initiator.num_indices), scissor.offset[0], scissor.offset[1],
++        scissor.extent[0], scissor.extent[1], height_used, normalized_depth_control.value,
++        regs[XE_GPU_REG_RB_STENCILREFMASK], normalized_color_mask,
++        regs[XE_GPU_REG_RB_BLENDCONTROL0], rb_colorcontrol.value,
++        !pixel_shader_known ? "unknown" : (pixel_shader ? "yes" : "none"),
++        regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ? "off" : "on",
++        uint32_t(pa_su_sc_mode_cntl.cull_front), uint32_t(pa_su_sc_mode_cntl.cull_back),
++        draw_reason ? fmt::format("not overwritten: {}", draw_reason)
++                    : fmt::format("replaces {},{} {}x{}", cutout.x_pixels, cutout.y_pixels,
++                                  cutout.width_pixels, cutout.height_pixels));
++  }
++
++  TransferStats& stats = transfer_stats_;
++  ++stats.updates_with_transfers;
++  rts_remaining = rts_with_transfers;
++  while (rex::bit_scan_forward(rts_remaining, &rt_index)) {
++    rts_remaining &= ~(uint32_t(1) << rt_index);
++    std::vector<Transfer>& transfers = last_update_transfers_[rt_index];
++    const bool rt_overwritten = (overwritten_rts & (uint32_t(1) << rt_index)) != 0;
++    size_t transfers_kept = 0;
++    for (size_t i = 0; i < transfers.size(); ++i) {
++      const Transfer& transfer = transfers[i];
++      uint64_t samples_needed = get_samples(rt_index, transfer, nullptr);
++      uint64_t samples_copied =
++          rt_overwritten ? get_samples(rt_index, transfer, &cutout) : samples_needed;
++      ++stats.transfers;
++      stats.samples_needed += samples_needed;
++      if (log_draw) {
++        RenderTargetKey dest_key = rts[rt_index]->key();
++        uint32_t pitch_tiles = dest_key.GetPitchTiles();
++        uint32_t local_start =
++            (transfer.start_tiles + xenos::kEdramTileCount - dest_key.base_tiles) &
++            (xenos::kEdramTileCount - 1);
++        uint32_t local_end = local_start + (transfer.end_tiles - transfer.start_tiles);
++        std::string outcome;
++        if (!rt_overwritten) {
++          outcome = fmt::format("copied, {}", rt_reasons[rt_index] ? rt_reasons[rt_index]
++                                                                   : draw_reason);
++        } else if (!samples_copied) {
++          outcome = apply ? "skipped" : "would be skipped";
++        } else if (samples_copied < samples_needed) {
++          outcome = fmt::format("{} {}k samples outside", apply ? "cut to" : "would be cut to",
++                                samples_copied / 1000);
++        } else {
++          outcome = "copied, outside the replaced area";
++        }
++        REXGPU_INFO("  {} <- {}{}: tiles {}-{}, rows {}-{}, {}k samples, {}",
++                    describe_render_target(dest_key),
++                    describe_render_target(transfer.source->key()),
++                    transfer.host_depth_source && transfer.host_depth_source != transfer.source
++                        ? fmt::format(" (host depth {})", describe_render_target(
++                                                              transfer.host_depth_source->key()))
++                        : std::string(),
++                    transfer.start_tiles, transfer.end_tiles, local_start / pitch_tiles,
++                    (local_end + pitch_tiles - 1) / pitch_tiles, samples_needed / 1000, outcome);
++      }
++      if (!apply) {
++        stats.samples_copied += samples_needed;
++        transfers_kept = transfers.size();
++        continue;
++      }
++      stats.samples_copied += samples_copied;
++      if (!samples_copied) {
++        ++stats.transfers_dropped;
++        continue;
++      }
++      if (samples_copied < samples_needed) {
++        ++stats.transfers_cut;
++      }
++      if (transfers_kept != i) {
++        transfers[transfers_kept] = transfer;
++      }
++      ++transfers_kept;
++    }
++    if (apply && transfers_kept < transfers.size()) {
++      transfers.erase(transfers.begin() + transfers_kept, transfers.end());
++    }
++  }
++  if (apply) {
++    last_update_transfer_cutout_rts_ = overwritten_rts;
++    last_update_transfer_cutout_ = cutout;
++  }
++}
++
+ uint32_t RenderTargetCache::GetLastUpdateBoundRenderTargets(
+     uint32_t* depth_and_color_formats_out) const {
+   if (GetPathCommon() != Path::kHostRenderTargets) {
+diff --git a/src/graphics/util/draw_extent_estimator.cpp b/src/graphics/util/draw_extent_estimator.cpp
+index 3e2c288..e59338d 100644
+--- a/src/graphics/util/draw_extent_estimator.cpp
++++ b/src/graphics/util/draw_extent_estimator.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <cfloat>
++#include <cmath>
+ #include <cstdint>
+ 
+ #include <rex/assert.h>
+@@ -22,6 +23,7 @@
+ #include <rex/graphics/trace_writer.h>
+ #include <rex/graphics/util/draw_extent_estimator.h>
+ #include <rex/graphics/xenos.h>
++#include <rex/math.h>
+ #include <rex/memory.h>
+ #include <rex/ui/graphics_util.h>
+ 
+@@ -63,9 +65,15 @@ namespace rex::graphics {
+ void DrawExtentEstimator::PositionYExportSink::Export(ucode::ExportRegister export_register,
+                                                       const float* value, uint32_t value_mask) {
+   if (export_register == ucode::ExportRegister::kVSPosition) {
++    if (value_mask & 0b0001) {
++      position_x_ = value[0];
++    }
+     if (value_mask & 0b0010) {
+       position_y_ = value[1];
+     }
++    if (value_mask & 0b0100) {
++      position_z_ = value[2];
++    }
+     if (value_mask & 0b1000) {
+       position_w_ = value[3];
+     }
+@@ -340,4 +348,334 @@ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
+   return max_y;
+ }
+ 
++const char* DrawExtentEstimator::GetDrawFullCoverage(const Shader& vertex_shader,
++                                                     const PixelRect& needed_rect,
++                                                     PixelRect& covered_out) {
++  SCOPE_profile_cpu_f("gpu");
++
++  const RegisterFile& regs = register_file_;
++
++  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
++  if (vgt_draw_initiator.source_select != xenos::SourceSelect::kDMA &&
++      vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex) {
++    return "index source";
++  }
++  if (regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
++      xenos::VGTOutputPath::kTessellationEnable) {
++    return "tessellation";
++  }
++  xenos::PrimitiveType primitive_type = vgt_draw_initiator.prim_type;
++  uint32_t index_count = vgt_draw_initiator.num_indices;
++  // Triangles as vertex index triplets, in the order the host draws them
++  // (the winding doesn't matter as culling is rejected).
++  static constexpr uint8_t kTriangleListVertices[2][3] = {{0, 1, 2}, {3, 4, 5}};
++  static constexpr uint8_t kTriangleStripVertices[2][3] = {{0, 1, 2}, {1, 3, 2}};
++  static constexpr uint8_t kTriangleFanVertices[2][3] = {{0, 1, 2}, {0, 2, 3}};
++  const uint8_t(*triangle_vertices)[3] = nullptr;
++  uint32_t triangle_count = 0;
++  switch (primitive_type) {
++    case xenos::PrimitiveType::kRectangleList:
++      if (index_count != 3) {
++        return "not one rectangle";
++      }
++      break;
++    case xenos::PrimitiveType::kTriangleList:
++      if (index_count != 3 && index_count != 6) {
++        return "not one or two triangles";
++      }
++      triangle_vertices = kTriangleListVertices;
++      triangle_count = index_count / 3;
++      break;
++    case xenos::PrimitiveType::kTriangleStrip:
++    case xenos::PrimitiveType::kTriangleFan:
++      if (index_count != 3 && index_count != 4) {
++        return "not one or two triangles";
++      }
++      triangle_vertices = primitive_type == xenos::PrimitiveType::kTriangleStrip
++                              ? kTriangleStripVertices
++                              : kTriangleFanVertices;
++      triangle_count = index_count - 2;
++      break;
++    default:
++      return "primitive type";
++  }
++
++  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
++  if (triangle_count) {
++    // Polygonal - faces may be culled, or drawn as wireframe or points.
++    if (pa_su_sc_mode_cntl.cull_front || pa_su_sc_mode_cntl.cull_back) {
++      return "face culling";
++    }
++    if (pa_su_sc_mode_cntl.poly_mode == xenos::PolygonModeEnable::kDualMode &&
++        (pa_su_sc_mode_cntl.polymode_front_ptype != xenos::PolygonType::kTriangles ||
++         pa_su_sc_mode_cntl.polymode_back_ptype != xenos::PolygonType::kTriangles)) {
++      return "polygon fill mode";
++    }
++  }
++
++  auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
++  if (pa_cl_clip_cntl.ucp_ena) {
++    return "user clip planes";
++  }
++  bool clip_enabled = !pa_cl_clip_cntl.clip_disable;
++  auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
++  if (clip_enabled &&
++      (pa_cl_vte_cntl.vtx_xy_fmt || pa_cl_vte_cntl.vtx_z_fmt || pa_cl_vte_cntl.vtx_w0_fmt)) {
++    return "clipped pre-transformed position";
++  }
++  if (!pa_cl_vte_cntl.vtx_xy_fmt && pa_cl_vte_cntl.vtx_w0_fmt) {
++    return "1/W position";
++  }
++
++  assert_true(vertex_shader.type() == xenos::ShaderType::kVertex);
++  assert_true(vertex_shader.is_ucode_analyzed());
++  if (!ShaderInterpreter::CanInterpretShader(vertex_shader)) {
++    return "vertex shader not interpretable";
++  }
++
++  // The window space transformation as done on the host (see
++  // draw_util::GetHostViewportInfo), with pixel edges at integers.
++  float scale_x =
++      pa_cl_vte_cntl.vport_x_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE) : 1.0f;
++  float scale_y =
++      pa_cl_vte_cntl.vport_y_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE) : 1.0f;
++  float offset_x =
++      pa_cl_vte_cntl.vport_x_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET) : 0.0f;
++  float offset_y =
++      pa_cl_vte_cntl.vport_y_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.0f;
++  float offset_add_x = 0.0f, offset_add_y = 0.0f;
++  if (pa_su_sc_mode_cntl.vtx_window_offset_enable) {
++    auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
++    offset_add_x += float(pa_sc_window_offset.window_x_offset);
++    offset_add_y += float(pa_sc_window_offset.window_y_offset);
++  }
++  if (REXCVAR_GET(half_pixel_offset) &&
++      regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero) {
++    offset_add_x += 0.5f;
++    offset_add_y += 0.5f;
++  }
++
++  auto vgt_dma_size = regs.Get<reg::VGT_DMA_SIZE>();
++  const uint16_t* index_buffer_16 = nullptr;
++  const uint32_t* index_buffer_32 = nullptr;
++  xenos::Endian index_endian = vgt_dma_size.swap_mode;
++  if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
++    if (vgt_dma_size.num_words < index_count) {
++      return "index buffer size";
++    }
++    uint32_t index_buffer_base = regs[XE_GPU_REG_VGT_DMA_BASE];
++    if (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16) {
++      if (index_endian == xenos::Endian::k8in32) {
++        index_endian = xenos::Endian::k8in16;
++      } else if (index_endian == xenos::Endian::k16in32) {
++        index_endian = xenos::Endian::kNone;
++      }
++      index_buffer_base &= ~uint32_t(sizeof(uint16_t) - 1);
++      index_buffer_16 = memory_.TranslatePhysical<const uint16_t*>(index_buffer_base);
++    } else {
++      index_buffer_base &= ~uint32_t(sizeof(uint32_t) - 1);
++      index_buffer_32 = memory_.TranslatePhysical<const uint32_t*>(index_buffer_base);
++    }
++    if (trace_writer_) {
++      trace_writer_->WriteMemoryRead(
++          index_buffer_base,
++          (index_buffer_16 ? sizeof(uint16_t) : sizeof(uint32_t)) * size_t(index_count));
++    }
++  }
++  uint32_t reset_index = regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx;
++  uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
++  uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
++  uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
++
++  // Doubles for exact enough edge tests with coordinates up to 8192.
++  double positions[6][2];
++  const char* failure = nullptr;
++  shader_interpreter_.SetShader(vertex_shader);
++  PositionYExportSink position_export_sink;
++  shader_interpreter_.SetExportSink(&position_export_sink);
++  for (uint32_t i = 0; i < index_count; ++i) {
++    uint32_t vertex_index = i;
++    if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
++      vertex_index = index_buffer_16 ? uint32_t(index_buffer_16[i]) : index_buffer_32[i];
++      vertex_index = xenos::GpuSwap(vertex_index, index_endian) & 0xFFFFFF;
++      if (pa_su_sc_mode_cntl.multi_prim_ib_ena && vertex_index == reset_index) {
++        failure = "primitive reset";
++        break;
++      }
++    }
++    vertex_index = std::min(max_index, std::max(min_index, (vertex_index + index_offset) & 0xFFFFFF));
++    position_export_sink.Reset();
++    shader_interpreter_.temp_registers()[0] = float(vertex_index);
++    shader_interpreter_.Execute();
++    if (position_export_sink.vertex_kill().has_value() &&
++        (position_export_sink.vertex_kill().value() & ~(UINT32_C(1) << 31))) {
++      failure = "vertex kill";
++      break;
++    }
++    if (!position_export_sink.position_x().has_value() ||
++        !position_export_sink.position_y().has_value()) {
++      failure = "position not exported";
++      break;
++    }
++    float x = position_export_sink.position_x().value();
++    float y = position_export_sink.position_y().value();
++    if (clip_enabled) {
++      // Must be inside the clip volume, so nothing is clipped.
++      if (!position_export_sink.position_z().has_value() ||
++          !position_export_sink.position_w().has_value()) {
++        failure = "position not exported";
++        break;
++      }
++      float z = position_export_sink.position_z().value();
++      float w = position_export_sink.position_w().value();
++      if (!(w > 0.0f) || !(std::abs(x) <= w) || !(std::abs(y) <= w) || !(z <= w) ||
++          !(z >= (pa_cl_clip_cntl.dx_clip_space_def ? 0.0f : -w))) {
++        failure = "outside the clip volume";
++        break;
++      }
++    }
++    if (!pa_cl_vte_cntl.vtx_xy_fmt) {
++      if (!position_export_sink.position_w().has_value()) {
++        failure = "position not exported";
++        break;
++      }
++      float w = position_export_sink.position_w().value();
++      if (!(w > 0.0f) || !std::isfinite(w)) {
++        failure = "position W";
++        break;
++      }
++      x /= w;
++      y /= w;
++    }
++    x = x * scale_x + offset_x + offset_add_x;
++    y = y * scale_y + offset_y + offset_add_y;
++    if (!std::isfinite(x) || !std::isfinite(y)) {
++      failure = "position not finite";
++      break;
++    }
++    positions[i][0] = x;
++    positions[i][1] = y;
++  }
++  shader_interpreter_.SetExportSink(nullptr);
++  if (failure) {
++    return failure;
++  }
++
++  // Bounding box of the vertices.
++  double box_left = positions[0][0], box_top = positions[0][1];
++  double box_right = box_left, box_bottom = box_top;
++  for (uint32_t i = 1; i < index_count; ++i) {
++    box_left = std::min(box_left, positions[i][0]);
++    box_top = std::min(box_top, positions[i][1]);
++    box_right = std::max(box_right, positions[i][0]);
++    box_bottom = std::max(box_bottom, positions[i][1]);
++  }
++  // Corner of the bounding box a vertex is at (bit 0 - right, bit 1 - bottom),
++  // or -1.
++  auto box_corner = [&](uint32_t vertex) -> int32_t {
++    const double* position = positions[vertex];
++    int32_t corner = 0;
++    if (position[0] == box_right) {
++      corner |= 1;
++    } else if (position[0] != box_left) {
++      return -1;
++    }
++    if (position[1] == box_bottom) {
++      corner |= 2;
++    } else if (position[1] != box_top) {
++      return -1;
++    }
++    return corner;
++  };
++  bool is_box = false;
++  if (box_right > box_left && box_bottom > box_top) {
++    if (!triangle_count) {
++      // Rectangle list: three distinct corners of an axis-aligned rectangle
++      // define it - the host computes the fourth one.
++      int32_t corners[3];
++      for (uint32_t i = 0; i < 3; ++i) {
++        corners[i] = box_corner(i);
++      }
++      is_box = corners[0] >= 0 && corners[1] >= 0 && corners[2] >= 0 &&
++               corners[0] != corners[1] && corners[1] != corners[2] && corners[0] != corners[2];
++    } else if (triangle_count == 2) {
++      // Two triangles, each with three distinct corners of the bounding box,
++      // without the opposite corners - the halves of the box on both sides of
++      // the same diagonal.
++      int32_t missing_corners[2];
++      is_box = true;
++      for (uint32_t i = 0; is_box && i < 2; ++i) {
++        uint32_t corner_mask = 0;
++        for (uint32_t j = 0; j < 3; ++j) {
++          int32_t corner = box_corner(triangle_vertices[i][j]);
++          if (corner < 0 || (corner_mask & (uint32_t(1) << corner))) {
++            is_box = false;
++            break;
++          }
++          corner_mask |= uint32_t(1) << corner;
++        }
++        if (is_box) {
++          uint32_t missing_corner;
++          rex::bit_scan_forward(~corner_mask & 0b1111, &missing_corner);
++          missing_corners[i] = int32_t(missing_corner);
++        }
++      }
++      is_box = is_box && (missing_corners[0] ^ missing_corners[1]) == 0b11;
++    }
++  }
++
++  if (is_box) {
++    // Pixels whose samples (at least 1/8 pixel from the edges, or 1/56 with
++    // resolution scaling up to 7x) are all inside, allowing for host rounding.
++    constexpr double kEdgeTolerance = 1.0 / 128.0;
++    auto clamp_edge = [](double edge) -> uint32_t {
++      return uint32_t(std::min(std::max(edge, 0.0), double(xenos::kTexture2DCubeMaxWidthHeight)));
++    };
++    covered_out.left = clamp_edge(std::ceil(box_left - kEdgeTolerance));
++    covered_out.top = clamp_edge(std::ceil(box_top - kEdgeTolerance));
++    covered_out.right = clamp_edge(std::floor(box_right + kEdgeTolerance));
++    covered_out.bottom = clamp_edge(std::floor(box_bottom + kEdgeTolerance));
++    if (covered_out.right <= covered_out.left || covered_out.bottom <= covered_out.top) {
++      return "covers no whole pixel";
++    }
++    return nullptr;
++  }
++  if (!triangle_count) {
++    return "rectangle not axis-aligned";
++  }
++  // One triangle containing the needed rectangle (its corners - it's convex).
++  if (needed_rect.right <= needed_rect.left || needed_rect.bottom <= needed_rect.top) {
++    return "nothing needed";
++  }
++  const double corners[4][2] = {
++      {double(needed_rect.left), double(needed_rect.top)},
++      {double(needed_rect.right), double(needed_rect.top)},
++      {double(needed_rect.left), double(needed_rect.bottom)},
++      {double(needed_rect.right), double(needed_rect.bottom)},
++  };
++  for (uint32_t i = 0; i < triangle_count; ++i) {
++    const double* a = positions[triangle_vertices[i][0]];
++    const double* b = positions[triangle_vertices[i][1]];
++    const double* c = positions[triangle_vertices[i][2]];
++    double area = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
++    if (!(std::abs(area) > 0.0)) {
++      continue;
++    }
++    bool contains = true;
++    for (uint32_t j = 0; contains && j < 4; ++j) {
++      const double* p = corners[j];
++      double e0 = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
++      double e1 = (c[0] - b[0]) * (p[1] - b[1]) - (c[1] - b[1]) * (p[0] - b[0]);
++      double e2 = (a[0] - c[0]) * (p[1] - c[1]) - (a[1] - c[1]) * (p[0] - c[0]);
++      contains = area > 0.0 ? (e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0)
++                            : (e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0);
++    }
++    if (contains) {
++      covered_out = needed_rect;
++      return nullptr;
++    }
++  }
++  return "triangles don't cover the area";
++}
++
+ }  // namespace rex::graphics
