@@ -9,7 +9,7 @@ Skate 2's dense city views issue 5,000–9,000 draws per frame. Each guest draw 
 | Cost | Cause | Change |
 | --- | --- | --- |
 | ROV render target path | ROV performs blending and depth/stencil in pixel shaders; slow at 2× on the tested NVIDIA GPU | RTV profile, with the draw-extent fix below |
-| CPU then GPU, not overlapped | A frame was submitted to the GPU only when complete, and the idle-clean synchronization then waited for all of it | `d3d12_submit_draw_interval` |
+| CPU then GPU, not overlapped | A frame was submitted to the GPU only when complete, and the idle-clean synchronization then waited for all of it | `d3d12_submit_draw_interval`; `d3d12_present_idleclean_sync_lag`, see [Idle-clean wait overlap](#idle-clean-wait-overlap) |
 | Driver command-list replay on the command processor thread | `DeferredCommandList::Execute` plus `ExecuteCommandLists`, about 22% of the thread | `d3d12_async_submission` |
 | Per-register and per-texture overhead | Register-table lookup on every register write, guest texture layout recomputed on every scaled-resolve check, locks and atomic counters in per-draw paths | `command-processor-overhead` patch |
 | New-texture hitches | Every texture was a separate committed resource; areas loading 400–600 new textures in one frame stalled for 150–190 ms | `d3d12_texture_placed_resources` |
@@ -43,7 +43,7 @@ The draw-extent estimate executes the vertex shader of such draws on the CPU onl
 | `gpu_render_target_transfer_skip_overwritten` | true | Don't copy the part of a render target transfer that the draw needing it replaces at every sample; see [Render target transfer skipping](#render-target-transfer-skipping) |
 | `gpu_render_target_transfer_skip_overwritten_validate` | false | Debug: fill the skipped areas with magenta and depth 0 before the draw, so areas the draw doesn't replace show up |
 | `gpu_render_target_transfer_log` | 0 (off) | Every this many frames, log transfers per frame and one frame's transfers in detail |
-| `d3d12_present_idleclean_sync_lag` | 0 | Experimental: how many recently closed frames may still run on the GPU when the idle-clean wait returns; see [Idle-clean wait overlap](#idle-clean-wait-overlap) |
+| `d3d12_present_idleclean_sync_lag` | 1 (Skate 2 profile; SDK default 0) | How many recently closed frames may still run on the GPU when the idle-clean wait returns; see [Idle-clean wait overlap](#idle-clean-wait-overlap) |
 | `d3d12_present_idleclean_log` | 0 (off) | Every this many frames, log the idle-clean waits: how many blocked, time waited, and frames still on the GPU |
 | `gpu_tiled_scene_single_pass` | true (Skate 2 profile; SDK default false) | Draw a tiled scene's first strip to the full screen height and skip the scene's replays for the other strips; see [Single-pass tiled scenes](#single-pass-tiled-scenes) |
 | `gpu_tiled_scene_log` | 0 (off) | Every this many frames, log tiled scenes, extended, skipped and kept draws, shifted resolves and fallback reasons per frame |
@@ -82,7 +82,7 @@ New-texture bursts with placed textures:
 | ~430 | 155 ms | 15–21 ms |
 | ~600 | 189 ms | 44 ms |
 
-Submit intervals of 256, 512 and 1024 were compared; 1024 was fastest and showed no visual problems. Disabling idle-clean synchronization entirely is faster still but produced visible corruption, so it remains enabled; see [Idle-clean wait overlap](#idle-clean-wait-overlap) for a narrower variant.
+Submit intervals of 256, 512 and 1024 were compared; 1024 was fastest and showed no visual problems. Disabling idle-clean synchronization entirely is faster still but produced visible corruption, so it remains enabled; the Skate 2 profile narrows it, see [Idle-clean wait overlap](#idle-clean-wait-overlap).
 
 ## Not yet verified
 
@@ -102,7 +102,7 @@ Submit intervals of 256, 512 and 1024 were compared; 1024 was fastest and showed
 - `clear_memory_page_state=false` was checked in one Free Skate session on the test PC, with no visual difference seen. Other game modes, longer play, the bail camera, replays and the Steam Deck have not been checked.
 - The GPU pass profile has only run on the test PC, on the title screen's attract scene. It has not run under Proton, where vkd3d-proton implements the timestamp queries, or in gameplay. Whether gameplay scenes are also drawn in three tiles has not been checked.
 - Render target transfer skipping was checked in Free Skate on the test PC and the Steam Deck, with no visual difference seen, but not with `gpu_render_target_transfer_skip_overwritten_validate`.
-- `d3d12_present_idleclean_sync_lag` has not run in the game. Whether a lag of 1 avoids the corruption seen without the idle-clean wait is the open question it is meant to answer.
+- `d3d12_present_idleclean_sync_lag=1` was checked in gameplay and menus on the test PC, with no colored stripes or black surfaces seen. The visual check on the Steam Deck is not finished. Other game modes, longer play, the bail camera and replays have not been checked separately.
 - AMD and Intel GPUs, other NVIDIA GPUs, and lower-core-count CPUs have not been measured. ROV remains the default for this reason.
 
 ## GPU trace capture
@@ -448,13 +448,13 @@ Approaches not taken:
 
 ## Idle-clean wait overlap
 
-With `d3d12_present_idleclean_sync` (on in every Skate 2 profile), the command processor waits for the GPU when the game writes `WAIT_UNTIL` with the 3D idle-clean bit (0x00020000) between closed frames (`MaybeSynchronizePresentIdleclean`, `src/graphics/d3d12/command_processor.cpp`). The game writes it about 30 times per frame. Only the one after the swap, before the next frame's first command, is honored; the others fall inside an open frame. The wait lasts until all submitted work has finished on the GPU, so the next frame is not translated while the GPU finishes the last one.
+With `d3d12_present_idleclean_sync` (on in every Skate 2 profile), the command processor waits for the GPU when the game writes `WAIT_UNTIL` with the 3D idle-clean bit (0x00020000) between closed frames (`MaybeSynchronizePresentIdleclean`, `src/graphics/d3d12/command_processor.cpp`). The game writes it about 30 times per frame. Two per frame are honored, after the swap and before the next frame's first command; the others fall inside an open frame. With `d3d12_present_idleclean_sync_lag=0` (see below), the first of the two lasts until all submitted work has finished on the GPU, and the second finds that work already done. The next frame is therefore not translated while the GPU finishes the last one.
 
 That costs the overlap at the end of every frame. The GPU's tail is mostly the work after the main scene: post-processing passes of a few draws each, resolves and the frame end, which the CPU records in far less time than the GPU runs it. In Free Skate on the Steam Deck with single-pass scenes, the command thread works 15.3 ms and the GPU 13.1 ms per frame, but a frame takes 21.8 ms, about 5 ms of it in this wait (`present_sync` in the frame profile, `limit=gpu_wait`). The test PC shows the same pattern at 4.45 ms per frame with 2.8 ms of CPU work and 3.3 ms of GPU time. Submitting more often doesn't shorten the tail: intervals of 512 and 256 draws didn't help on the Steam Deck.
 
 What the wait protects is not known. It was added when unlimited presentation showed colored stripes and black surfaces that the paced 60 FPS mode didn't; the corrupted resource wasn't traced, and turning the wait off on the RTV profile later still showed corruption. A review of this runtime found no path where translating a frame depends on the previous frame having finished on the GPU: shared memory uploads, texture loads, resolves and render target transfers are ordered on one queue; upload, constant and descriptor pools and command allocators are reclaimed by fences; `readback_resolve` is `none`, gameplay uses no memory export, and occlusion query results are written once their submission has completed. Without the wait, up to three frames can be in flight (`kQueueFrames`).
 
-`d3d12_present_idleclean_sync_lag` (`rexglue-0.10.0-present-idleclean-lag.patch`, default 0, applies live) narrows the wait to an older frame instead, using the last submission of each closed frame (`closed_frame_submissions_`):
+`d3d12_present_idleclean_sync_lag` (`rexglue-0.10.0-present-idleclean-lag.patch`, off by default in the SDK, 1 in the Skate 2 profile, applies live) narrows the wait to an older frame instead, using the last submission of each closed frame (`closed_frame_submissions_`):
 
 | Value | The idle-clean wait returns when |
 | --- | --- |
@@ -462,7 +462,16 @@ What the wait protects is not known. It was added when unlimited presentation sh
 | 1 | The frame before the last one has finished: the GPU finishes the last frame while the next one is translated, at most one frame of overlap |
 | 2 | The frame two before the last one has finished, which opening the next frame already waits for: the same as turning the wait off |
 
-If 1 shows no corruption, frame time should move towards the larger of CPU and GPU time: about 16–17 ms instead of 21.8 ms on the Steam Deck, and about 3.3–3.6 ms instead of 4.45 ms on the test PC. If 1 shows the corruption, the hazard needs the last frame finished before the next one is translated, which narrows the search.
+Measured on the test PC in the same gameplay spot:
+
+| | Draws per frame | `present_sync` | Frame time |
+| --- | --- | --- | --- |
+| Lag 0 | about 4,100 | 1.35 ms | 7.27 ms (137 FPS) |
+| Lag 1 | about 4,100 | 0 | 5.93 ms (169 FPS) |
+
+Command thread work (5.6 ms) and GPU busy time (3.35 ms) were unchanged, and the frame profile showed `limit=command_thread` in both. A lighter view (about 2,570 draws) ran at 3.74 ms (267 FPS) with lag 1, and menus went from about 4.4 to 3.65 ms. In gameplay with lag 1 the idle-clean waits never blocked. No colored stripes or black surfaces were seen on the test PC. On the Steam Deck the frame rate looked good with lag 1, but the visual check there is not finished.
+
+The Skate 2 profile sets lag 1. `--d3d12_present_idleclean_sync_lag=0` (or `d3d12_present_idleclean_sync_lag = 0` in `skate2.toml`) restores the full wait. If lag 1 shows the corruption, the hazard needs the last frame finished before the next one is translated, which narrows the search.
 
 `d3d12_present_idleclean_log=N` logs every N frames: honored waits per frame, how many of them blocked, the time waited on average and at most, how many closed frames were still on the GPU when waiting, and how many waits used an older frame because of the lag.
 

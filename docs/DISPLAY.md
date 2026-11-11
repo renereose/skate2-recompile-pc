@@ -21,6 +21,8 @@ The default profile also turns off the runtime's frame-end refresh of memory pag
 
 The default profile also draws the main scene once instead of in the console's two framebuffer strips (`gpu_tiled_scene_single_pass`). In the same Free Skate spot this raised the test PC from 176 to 224 FPS at 2x, and the Steam Deck from 35 to 46 FPS. See [Single-pass tiled scenes](PERFORMANCE.md#single-pass-tiled-scenes). If the bottom sixth of the screen looks missing, stale or wrongly shaded, set `gpu_tiled_scene_single_pass = false` in `skate2.toml` to draw it strip by strip again.
 
+The default profile also lets the GPU finish the last frame while the next one is translated (`d3d12_present_idleclean_sync_lag = 1`), instead of waiting at each frame end until all GPU work is done. At a busy gameplay spot this raised the test PC from 137 to 169 FPS, with no visual difference seen; the visual check on the Steam Deck is not finished. See [Idle-clean wait overlap](PERFORMANCE.md#idle-clean-wait-overlap). If colored stripes or black surfaces appear, set `d3d12_present_idleclean_sync_lag = 0` in `skate2.toml` to wait for the whole frame again.
+
 Earlier versions of the default launchers always passed unlimited, 2x and ROV, which overrode saved values. Settings saved before, for example a frame-rate mode, render scale or render path saved from F4, now take effect. If the game starts with different settings than before, check them in the settings panel (F1).
 
 The native EXE runs the existing PowerShell startup logic. v0.1.1 changes the entrypoint and packaging while preserving the v0.1.0 game/runtime binaries and graphics fixes.

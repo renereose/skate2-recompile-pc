@@ -47,7 +47,8 @@ class Skate2App : public rex::ReXApp {
                             "skate2_frame_limit", "skate2_nvidia_max_performance",
                             "resolution_scale", "draw_resolution_scale_x",
                             "draw_resolution_scale_y", "gpu_tiled_scene_single_pass",
-                            "gpu_render_target_transfer_skip_overwritten"}) {
+                            "gpu_render_target_transfer_skip_overwritten",
+                            "d3d12_present_idleclean_sync_lag"}) {
       REXLOG_INFO("Graphics setting {}={}", flag, rex::cvar::GetFlagByName(flag));
     }
     // The SDK exposes per-frame CSV counters but does not open the configured
@@ -219,6 +220,12 @@ class Skate2App : public rex::ReXApp {
         // visual difference seen. Scenes that do not fit fall back to strips.
         // --gpu_tiled_scene_single_pass=false restores strip-by-strip drawing.
         {"gpu_tiled_scene_single_pass", "true"},
+        // The idle-clean wait after each swap waits only for the frame before
+        // last, so the GPU finishes the last frame while the next one is
+        // translated. A busy gameplay spot on PC (about 4,100 draws): 137 to
+        // 169 FPS, with no visual difference seen.
+        // --d3d12_present_idleclean_sync_lag=0 restores the full wait.
+        {"d3d12_present_idleclean_sync_lag", "1"},
     };
     // The registry has no call to change a default, so its entries are
     // updated directly, as the runtime's settings overlay also reads them.

@@ -547,13 +547,17 @@ MEASURING FPS ON THE DECK
    to draw it strip by strip again, and report where it happened.
    --gpu_tiled_scene_log=600 logs "Tiled scenes" lines with the draws
    skipped per frame.
-   Experimental: at the end of every frame the game waits until the GPU
-   has finished it (about 5 ms per frame in Free Skate on the Deck).
-     --d3d12_present_idleclean_sync_lag=1 --d3d12_present_idleclean_log=600
-   lets the GPU finish one frame while the next is prepared. Turning the
-   wait off completely caused colored stripes and black surfaces, so watch
-   for those; if they appear, remove the option. The log then shows
-   "Idle-clean waits" lines with the time waited per frame.
+   At the end of every frame the game waits for the GPU. Waiting until
+   the GPU had finished the whole frame cost about 5 ms per frame in Free
+   Skate on the Deck; by default (d3d12_present_idleclean_sync_lag = 1) the
+   GPU now finishes the last frame while the next one is prepared. This
+   was checked on the PC; on the Deck the visual check is not finished.
+   Turning the wait off completely caused colored stripes and black
+   surfaces. If those appear, add
+     --d3d12_present_idleclean_sync_lag=0
+   to wait for the whole frame again, and report where it happened.
+   --d3d12_present_idleclean_log=600 logs "Idle-clean waits" lines with
+   the time waited per frame.
 
 CONTROLLER AND SETTINGS PANEL
    Steam Input presents the Deck's controls to the game as an Xbox
